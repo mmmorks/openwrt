@@ -467,6 +467,44 @@
 			#pcs-cells = <0>;
 		};
 
+		/*
+		 * The PON PHY and PON MAC: a GPON or XGS-PON uplink on GMAC port 2.
+		 * The PHY's serdes window is pon_pcs's pcs_ana and pcs_pma windows:
+		 * both drive the one serdes, so a board enables either pon_pcs (an
+		 * Ethernet uplink on port 2) or these two. The board adds the optics:
+		 * the transmit-disable line and signal polarities, the laser
+		 * controller as the MAC's second PHY, the optics' supplies, the fibre
+		 * path mux and the loss-of-signal lines.
+		 */
+		en7581_pon_phy: phy@1fa8a000 {
+			compatible = "airoha,en7581-pon-phy";
+			reg = <0x0 0x1fa8a000 0x0 0x2000>,
+			      <0x0 0x1faf0000 0x0 0x1000>;
+			reg-names = "serdes", "line";
+			interrupts = <GIC_SPI 43 IRQ_TYPE_LEVEL_HIGH>;
+			airoha,scu = <&scuclk>;
+			airoha,chip-scu = <&chip_scu>;
+			resets = <&scuclk EN7581_XPON_PHY_RST>;
+			#phy-cells = <0>;
+
+			status = "disabled";
+		};
+
+		en7581_pon_mac: pon-mac@1fb64000 {
+			compatible = "airoha,en7581-pon-mac";
+			reg = <0x0 0x1fb64000 0x0 0x1000>,
+			      <0x0 0x1fb65000 0x0 0x1000>;
+			reg-names = "gpon", "xgspon";
+			interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 34 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "mac", "power-fail";
+			resets = <&scuclk EN7581_XPON_MAC_RST>;
+			airoha,scu = <&scuclk>;
+			airoha,pon-port = <&gdm2>;
+
+			status = "disabled";
+		};
+
 		eth_pcs: pcs@1fa09000 {
 			compatible = "airoha,an7581-pcs-eth";
 			reg = <0x0 0x1fa09000 0x0 0x1000>,
