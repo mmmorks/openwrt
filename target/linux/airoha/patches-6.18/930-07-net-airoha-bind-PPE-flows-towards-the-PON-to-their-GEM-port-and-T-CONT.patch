@@ -1,0 +1,316 @@
+From: John Morkel <john@morkel.me>
+Date: Thu, 8 Oct 2026 23:06:00 -0700
+Subject: [PATCH] net: airoha: bind PPE flows towards the PON to their GEM port and T-CONT
+
+A PPE entry for a flow that leaves through the PON port must carry what
+the CPU path puts in the TX message words: the T-CONT as the QoS
+channel and as the next-hop queue, the GEM port's queue as the QoS
+queue, and the GEM port in place of the ethertype. Look them up with
+the same classification rules, from the VLAN ID and PCP of the first
+tag the flow pushes, when the flow is offloaded, and refuse the offload
+when it maps to no open T-CONT.
+
+The mapping can change under a bound flow. Look it up again every time
+a flow is bound to a PPE entry, and unbind every flow towards the PON
+when the GEM port table or the rules are replaced, or a T-CONT closes;
+each flow binds again with its next frame, with what it maps to then.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 0691fb5..5202e76 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -512,6 +512,7 @@ struct airoha_flow_data {
+ 		struct {
+ 			u16 id;
+ 			__be16 proto;
++			u8 prio;
+ 		} hdr[2];
+ 		u8 num;
+ 	} vlan;
+@@ -545,6 +546,11 @@ struct airoha_flow_table_entry {
+ 	struct rhash_head node;
+ 	unsigned long cookie;
+ 
++	/* a flow towards a PON port: what its GEM port is looked up by */
++	struct airoha_pon *pon;
++	u16 pon_vid;
++	u8 pon_pcp;
++
+ 	/* Must be last --ends in a flexible-array member. */
+ 	struct airoha_foe_entry data;
+ };
+@@ -813,6 +819,8 @@ int airoha_pon_tx_msg(struct airoha_pon *pon, struct sk_buff *skb, u32 *msg0,
+ void airoha_pon_ctrl_tx_wake(struct airoha_pon *pon);
+ int airoha_pon_rx(struct airoha_pon *pon, struct sk_buff *skb, u32 msg0,
+ 		  u32 msg1);
++int airoha_pon_resolve(struct airoha_pon *pon, u16 vid, u8 pcp,
++		       struct airoha_pon_gem *gem);
+ 
+ void airoha_ppe_set_xmit_frame_size(struct airoha_gdm_dev *dev);
+ void airoha_ppe_set_cpu_port(struct airoha_gdm_dev *dev, u8 ppe_id, u8 fport);
+@@ -822,6 +830,7 @@ void airoha_ppe_check_skb(struct airoha_ppe_dev *dev, struct sk_buff *skb,
+ int airoha_ppe_setup_tc_block_cb(struct airoha_ppe_dev *dev, void *type_data);
+ int airoha_ppe_init(struct airoha_eth *eth);
+ void airoha_ppe_deinit(struct airoha_eth *eth);
++void airoha_ppe_flush_pon_flows(struct airoha_eth *eth);
+ void airoha_ppe_init_upd_mem(struct airoha_gdm_dev *dev, const u8 *addr);
+ u32 airoha_ppe_get_total_num_entries(struct airoha_ppe *ppe);
+ struct airoha_foe_entry *airoha_ppe_foe_get_entry(struct airoha_ppe *ppe,
+diff --git a/drivers/net/ethernet/airoha/airoha_pon.c b/drivers/net/ethernet/airoha/airoha_pon.c
+index 63adb60..6e970a4 100644
+--- a/drivers/net/ethernet/airoha/airoha_pon.c
++++ b/drivers/net/ethernet/airoha/airoha_pon.c
+@@ -404,6 +404,10 @@ int airoha_pon_set_gems(struct airoha_pon *pon,
+ 		err = airoha_pon_replace_map(pon, sorted, n, NULL, -1);
+ 	kfree(sorted);
+ 
++	/* PPE entries carry the GEM port and T-CONT they were bound with */
++	if (!err)
++		airoha_ppe_flush_pon_flows(airoha_pon_eth(pon));
++
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(airoha_pon_set_gems);
+@@ -420,6 +424,7 @@ int airoha_pon_set_rules(struct airoha_pon *pon,
+ 			 const struct airoha_pon_rule *rules, unsigned int n)
+ {
+ 	unsigned int i;
++	int err;
+ 
+ 	if (n > AIROHA_PON_MAX_RULES)
+ 		return -EINVAL;
+@@ -436,7 +441,11 @@ int airoha_pon_set_rules(struct airoha_pon *pon,
+ 			return -EINVAL;
+ 	}
+ 
+-	return airoha_pon_replace_map(pon, NULL, -1, rules, n);
++	err = airoha_pon_replace_map(pon, NULL, -1, rules, n);
++	if (!err)
++		airoha_ppe_flush_pon_flows(airoha_pon_eth(pon));
++
++	return err;
+ }
+ EXPORT_SYMBOL_GPL(airoha_pon_set_rules);
+ 
+@@ -505,6 +514,8 @@ EXPORT_SYMBOL_GPL(airoha_pon_tcont_open);
+  *
+  * Call it when the OLT withdraws the T-CONT's Alloc-ID. The T-CONT's
+  * queues close; frames already in them stay there until it opens again.
++ * PPE flows towards the PON are unbound, so the ones on other T-CONTs bind
++ * again with their next frame.
+  *
+  * Return: 0 or -EINVAL.
+  */
+@@ -524,6 +535,8 @@ int airoha_pon_tcont_close(struct airoha_pon *pon, unsigned int tcont)
+ 
+ 	mutex_unlock(&pon->lock);
+ 
++	airoha_ppe_flush_pon_flows(airoha_pon_eth(pon));
++
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(airoha_pon_tcont_close);
+@@ -638,8 +651,8 @@ airoha_pon_find_gem(const struct airoha_pon_map *map, u16 port_id)
+ /* The GEM port entry of an upstream frame, with an open T-CONT; call it
+  * under RCU.
+  */
+-static int airoha_pon_resolve(struct airoha_pon *pon, u16 vid, u8 pcp,
+-			      struct airoha_pon_gem *out)
++int airoha_pon_resolve(struct airoha_pon *pon, u16 vid, u8 pcp,
++		       struct airoha_pon_gem *out)
+ {
+ 	const struct airoha_pon_gem *gem = NULL;
+ 	const struct airoha_pon_map *map;
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 36a37f6..84a7c24 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -768,6 +768,61 @@ static int airoha_ppe_foe_commit_sram_entry(struct airoha_ppe *ppe, u32 hash)
+ 					REG_PPE_RAM_CTRL(ppe2));
+ }
+ 
++static void airoha_ppe_foe_set_pon(struct airoha_foe_entry *hwe,
++				   const struct airoha_pon_gem *gem)
++{
++	int type = FIELD_GET(AIROHA_FOE_IB1_BIND_PACKET_TYPE, hwe->ib1);
++	struct airoha_foe_mac_info_common *l2;
++	u32 *data, *ib2;
++
++	if (type == PPE_PKT_TYPE_BRIDGE) {
++		data = &hwe->bridge.data;
++		ib2 = &hwe->bridge.ib2;
++		l2 = &hwe->bridge.l2.common;
++	} else if (type >= PPE_PKT_TYPE_IPV6_ROUTE_3T) {
++		data = &hwe->ipv6.data;
++		ib2 = &hwe->ipv6.ib2;
++		l2 = &hwe->ipv6.l2;
++	} else {
++		data = &hwe->ipv4.data;
++		ib2 = &hwe->ipv4.ib2;
++		l2 = &hwe->ipv4.l2.common;
++	}
++
++	/* the T-CONT is the QoS channel and the next-hop queue, the GEM
++	 * port's queue the QoS queue, and the GEM port takes the place of the
++	 * ethertype
++	 */
++	*data &= ~(AIROHA_FOE_CHANNEL | AIROHA_FOE_QID);
++	*data |= FIELD_PREP(AIROHA_FOE_CHANNEL, gem->tcont) |
++		 FIELD_PREP(AIROHA_FOE_QID, gem->queue);
++	*ib2 &= ~AIROHA_FOE_IB2_NBQ;
++	*ib2 |= FIELD_PREP(AIROHA_FOE_IB2_NBQ, gem->tcont);
++	l2->etype = gem->port_id;
++}
++
++/* Look up again the GEM port, T-CONT and queue of a flow towards a PON
++ * port. Return: false when the flow must not be bound now.
++ */
++static bool airoha_ppe_foe_pon_refresh(struct airoha_flow_table_entry *e)
++{
++	struct airoha_pon_gem gem;
++	int err;
++
++	if (!e->pon)
++		return true;
++
++	rcu_read_lock();
++	err = airoha_pon_resolve(e->pon, e->pon_vid, e->pon_pcp, &gem);
++	rcu_read_unlock();
++	if (err)
++		return false;
++
++	airoha_ppe_foe_set_pon(&e->data, &gem);
++
++	return true;
++}
++
+ static int airoha_ppe_foe_commit_entry(struct airoha_ppe *ppe,
+ 				       struct airoha_foe_entry *e,
+ 				       u32 hash, bool rx_wlan)
+@@ -935,6 +990,9 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 		if (!airoha_ppe_foe_compare_entry(e, hwe))
+ 			continue;
+ 
++		if (!airoha_ppe_foe_pon_refresh(e))
++			continue;
++
+ 		airoha_ppe_foe_commit_entry(ppe, &e->data, hash, rx_wlan);
+ 		commit_done = true;
+ 		e->hash = hash;
+@@ -946,7 +1004,7 @@ static void airoha_ppe_foe_insert_entry(struct airoha_ppe *ppe,
+ 	airoha_ppe_foe_set_bridge_addrs(&br, eth_hdr(skb));
+ 	e = rhashtable_lookup_fast(&ppe->l2_flows, &br,
+ 				   airoha_l2_flow_table_params);
+-	if (e)
++	if (e && airoha_ppe_foe_pon_refresh(e))
+ 		airoha_ppe_foe_commit_subflow_entry(ppe, e, hash, rx_wlan);
+ unlock:
+ 	spin_unlock_bh(&ppe_lock);
+@@ -1086,6 +1144,21 @@ static int airoha_ppe_entry_idle_time(struct airoha_ppe *ppe,
+ 	return airoha_ppe_get_entry_idle_time(ppe, e->data.ib1);
+ }
+ 
++static struct airoha_pon *airoha_ppe_get_pon(struct airoha_eth *eth,
++					     struct net_device *netdev)
++{
++	struct airoha_gdm_dev *dev;
++
++	if (!netdev)
++		return NULL;
++
++	dev = netdev_priv(netdev);
++	if (!airoha_is_valid_gdm_dev(eth, dev))
++		return NULL;
++
++	return dev->pon;
++}
++
+ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 					   struct flow_cls_offload *f)
+ {
+@@ -1178,6 +1251,7 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 
+ 			data.vlan.hdr[data.vlan.num].id = act->vlan.vid;
+ 			data.vlan.hdr[data.vlan.num].proto = act->vlan.proto;
++			data.vlan.hdr[data.vlan.num].prio = act->vlan.prio;
+ 			data.vlan.num++;
+ 			break;
+ 		case FLOW_ACTION_VLAN_POP:
+@@ -1274,6 +1348,18 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 	e->cookie = f->cookie;
+ 	memcpy(&e->data, &hwe, sizeof(e->data));
+ 
++	e->pon = airoha_ppe_get_pon(eth, odev);
++	if (e->pon) {
++		/* the first tag the flow pushes is the one it leaves with */
++		e->pon_vid = data.vlan.num ? data.vlan.hdr[0].id
++					   : AIROHA_PON_VID_UNTAGGED;
++		e->pon_pcp = data.vlan.num ? data.vlan.hdr[0].prio : 0;
++		if (!airoha_ppe_foe_pon_refresh(e)) {
++			err = -EOPNOTSUPP;
++			goto free_entry;
++		}
++	}
++
+ 	err = airoha_ppe_foe_flow_commit_entry(eth->ppe, e);
+ 	if (err)
+ 		goto free_entry;
+@@ -1389,6 +1475,56 @@ static int airoha_ppe_flow_offload_cmd(struct airoha_eth *eth,
+ 	return -EOPNOTSUPP;
+ }
+ 
++/* Unbind every PPE flow towards a PON port, after its GEM ports or T-CONTs
++ * changed. A flow binds again, with what it maps to then, when its next
++ * frame reaches the CPU.
++ */
++void airoha_ppe_flush_pon_flows(struct airoha_eth *eth)
++{
++	struct airoha_ppe *ppe = eth->ppe;
++	struct airoha_flow_table_entry *e;
++	struct rhashtable_iter iter;
++
++	mutex_lock(&flow_offload_mutex);
++
++	rhashtable_walk_enter(&eth->flow_table, &iter);
++	rhashtable_walk_start(&iter);
++	while ((e = rhashtable_walk_next(&iter))) {
++		if (IS_ERR(e)) {
++			if (PTR_ERR(e) == -EAGAIN)
++				continue;
++			break;
++		}
++
++		if (!e->pon)
++			continue;
++
++		spin_lock_bh(&ppe_lock);
++		if (e->type == FLOW_TYPE_L2) {
++			struct airoha_flow_table_entry *f;
++			struct hlist_node *n;
++
++			hlist_for_each_entry_safe(f, n, &e->l2_flows,
++						  l2_subflow_node)
++				airoha_ppe_foe_remove_flow(ppe, f);
++		} else if (e->hash != 0xffff) {
++			struct airoha_foe_entry hwe;
++
++			memcpy(&hwe, &e->data, sizeof(hwe));
++			hwe.ib1 &= ~AIROHA_FOE_IB1_BIND_STATE;
++			hwe.ib1 |= FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE,
++					      AIROHA_FOE_STATE_INVALID);
++			airoha_ppe_foe_commit_entry(ppe, &hwe, e->hash, false);
++			e->hash = 0xffff;
++		}
++		spin_unlock_bh(&ppe_lock);
++	}
++	rhashtable_walk_stop(&iter);
++	rhashtable_walk_exit(&iter);
++
++	mutex_unlock(&flow_offload_mutex);
++}
++
+ static int airoha_ppe_flush_sram_entries(struct airoha_ppe *ppe)
+ {
+ 	u32 sram_num_entries = airoha_ppe_get_total_sram_num_entries(ppe);
