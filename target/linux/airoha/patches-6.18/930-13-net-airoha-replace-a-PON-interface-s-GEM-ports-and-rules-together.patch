@@ -1,0 +1,240 @@
+From: John Morkel <john@morkel.me>
+Date: Sun, 11 Oct 2026 12:00:00 -0700
+Subject: [PATCH] net: airoha: replace a PON interface's GEM ports and rules
+ together
+
+A PON MAC driver that takes a new datapath configuration has a new GEM
+port table and new rules to give the interface. airoha_pon_set_rules()
+and airoha_pon_set_gems() each publish their table on their own, so
+between the two calls a frame is classified by a new rule onto the old
+GEM port table: it is dropped, or goes up on the T-CONT the old table
+gave its GEM port. When the second call fails, the interface keeps the
+new rules over the old GEM ports until the next table, and each call
+flushes the PON flows of the PPE.
+
+Add airoha_pon_set_table(), which checks both tables as the two setters
+do and publishes them in one map, with one flush. Nothing changes when
+either table is refused. The two setters keep their checks, which move
+into helpers the three share.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_pon.c b/drivers/net/ethernet/airoha/airoha_pon.c
+index ecbc75d..81a88b4 100644
+--- a/drivers/net/ethernet/airoha/airoha_pon.c
++++ b/drivers/net/ethernet/airoha/airoha_pon.c
+@@ -411,6 +411,68 @@ static int airoha_pon_replace_map(struct airoha_pon *pon,
+ 	return 0;
+ }
+ 
++/*
++ * Sort a copy of @gems by port_id into *@sorted, checking it as
++ * airoha_pon_set_gems() documents.
++ */
++static int airoha_pon_sort_gems(const struct airoha_pon_gem *gems,
++				unsigned int n, struct airoha_pon_gem **sorted)
++{
++	struct airoha_pon_gem *s;
++	unsigned int i;
++
++	if (n > AIROHA_PON_MAX_GEMS)
++		return -EINVAL;
++
++	s = kmemdup_array(gems, n, sizeof(*gems), GFP_KERNEL);
++	if (n && !s)
++		return -ENOMEM;
++
++	sort(s, n, sizeof(*s), airoha_pon_gem_cmp, NULL);
++
++	for (i = 0; i < n; i++) {
++		const struct airoha_pon_gem *gem = &s[i];
++
++		if (gem->port_id == 0xffff ||
++		    (gem->flags & ~(AIROHA_PON_GEM_UPSTREAM |
++				    AIROHA_PON_GEM_DOWNSTREAM)) ||
++		    ((gem->flags & AIROHA_PON_GEM_UPSTREAM) &&
++		     (gem->tcont >= AIROHA_PON_NUM_TCONTS ||
++		      gem->queue >= AIROHA_PON_TCONT_QUEUES)) ||
++		    (i && gem->port_id == s[i - 1].port_id)) {
++			kfree(s);
++			return -EINVAL;
++		}
++	}
++
++	*sorted = s;
++	return 0;
++}
++
++/* Check @rules as airoha_pon_set_rules() documents. */
++static int airoha_pon_check_rules(const struct airoha_pon_rule *rules,
++				  unsigned int n)
++{
++	unsigned int i;
++
++	if (n > AIROHA_PON_MAX_RULES)
++		return -EINVAL;
++
++	for (i = 0; i < n; i++) {
++		const struct airoha_pon_rule *rule = &rules[i];
++
++		if (rule->vid >= VLAN_N_VID &&
++		    rule->vid != AIROHA_PON_VID_UNTAGGED &&
++		    rule->vid != AIROHA_PON_VID_ANY)
++			return -EINVAL;
++
++		if (rule->pcp > 7 && rule->pcp != AIROHA_PON_PCP_ANY)
++			return -EINVAL;
++	}
++
++	return 0;
++}
++
+ /**
+  * airoha_pon_set_gems() - replace the GEM port table
+  * @pon: the interface
+@@ -430,36 +492,13 @@ int airoha_pon_set_gems(struct airoha_pon *pon,
+ 			const struct airoha_pon_gem *gems, unsigned int n)
+ {
+ 	struct airoha_pon_gem *sorted;
+-	unsigned int i;
+ 	int err;
+ 
+-	if (n > AIROHA_PON_MAX_GEMS)
+-		return -EINVAL;
+-
+-	sorted = kmemdup_array(gems, n, sizeof(*gems), GFP_KERNEL);
+-	if (n && !sorted)
+-		return -ENOMEM;
+-
+-	sort(sorted, n, sizeof(*sorted), airoha_pon_gem_cmp, NULL);
+-
+-	err = 0;
+-	for (i = 0; i < n; i++) {
+-		const struct airoha_pon_gem *gem = &sorted[i];
+-
+-		if (gem->port_id == 0xffff ||
+-		    (gem->flags & ~(AIROHA_PON_GEM_UPSTREAM |
+-				    AIROHA_PON_GEM_DOWNSTREAM)) ||
+-		    ((gem->flags & AIROHA_PON_GEM_UPSTREAM) &&
+-		     (gem->tcont >= AIROHA_PON_NUM_TCONTS ||
+-		      gem->queue >= AIROHA_PON_TCONT_QUEUES)) ||
+-		    (i && gem->port_id == sorted[i - 1].port_id)) {
+-			err = -EINVAL;
+-			break;
+-		}
+-	}
++	err = airoha_pon_sort_gems(gems, n, &sorted);
++	if (err)
++		return err;
+ 
+-	if (!err)
+-		err = airoha_pon_replace_map(pon, sorted, n, NULL, -1);
++	err = airoha_pon_replace_map(pon, sorted, n, NULL, -1);
+ 	kfree(sorted);
+ 
+ 	/* PPE entries carry the GEM port and T-CONT they were bound with */
+@@ -484,40 +523,71 @@ EXPORT_SYMBOL_GPL(airoha_pon_set_gems);
+ int airoha_pon_set_rules(struct airoha_pon *pon,
+ 			 const struct airoha_pon_rule *rules, unsigned int n)
+ {
+-	unsigned int i;
+ 	int err;
+ 
+-	if (n > AIROHA_PON_MAX_RULES)
+-		return -EINVAL;
++	err = airoha_pon_check_rules(rules, n);
++	if (err)
++		return err;
+ 
+-	for (i = 0; i < n; i++) {
+-		const struct airoha_pon_rule *rule = &rules[i];
++	err = airoha_pon_replace_map(pon, NULL, -1, rules, n);
++	if (!err)
++		airoha_ppe_flush_pon_flows(airoha_pon_eth(pon));
+ 
+-		if (rule->vid >= VLAN_N_VID &&
+-		    rule->vid != AIROHA_PON_VID_UNTAGGED &&
+-		    rule->vid != AIROHA_PON_VID_ANY)
+-			return -EINVAL;
++	return err;
++}
++EXPORT_SYMBOL_GPL(airoha_pon_set_rules);
+ 
+-		if (rule->pcp > 7 && rule->pcp != AIROHA_PON_PCP_ANY)
+-			return -EINVAL;
+-	}
++/**
++ * airoha_pon_set_table() - replace the GEM port table and the rules
++ * @pon: the interface
++ * @gems: the new GEM port table, as airoha_pon_set_gems() takes it
++ * @num_gems: its length
++ * @rules: the new rules, as airoha_pon_set_rules() takes them
++ * @num_rules: their number
++ *
++ * Both change in one update: no frame is classified by a new rule onto the
++ * old GEM port table, or by an old rule onto the new one, and when either
++ * table is refused neither changes.
++ *
++ * Return: 0, or the error airoha_pon_set_gems() or airoha_pon_set_rules()
++ * returns for its table.
++ */
++int airoha_pon_set_table(struct airoha_pon *pon,
++			 const struct airoha_pon_gem *gems,
++			 unsigned int num_gems,
++			 const struct airoha_pon_rule *rules,
++			 unsigned int num_rules)
++{
++	struct airoha_pon_gem *sorted;
++	int err;
+ 
+-	err = airoha_pon_replace_map(pon, NULL, -1, rules, n);
++	err = airoha_pon_check_rules(rules, num_rules);
++	if (err)
++		return err;
++
++	err = airoha_pon_sort_gems(gems, num_gems, &sorted);
++	if (err)
++		return err;
++
++	err = airoha_pon_replace_map(pon, sorted, num_gems, rules, num_rules);
++	kfree(sorted);
++
++	/* PPE entries carry the GEM port and T-CONT they were bound with */
+ 	if (!err)
+ 		airoha_ppe_flush_pon_flows(airoha_pon_eth(pon));
+ 
+ 	return err;
+ }
+-EXPORT_SYMBOL_GPL(airoha_pon_set_rules);
++EXPORT_SYMBOL_GPL(airoha_pon_set_table);
+ 
+ /**
+  * airoha_pon_check_ifindex() - check a device a request names
+  * @pon: the interface
+  * @ifindex: an ANI port device's ifindex, or 0 for the interface itself
+  *
+- * airoha_pon_set_gems() and airoha_pon_set_rules() take any ifindex, since
+- * a device can go while a table naming it is in use; a PON MAC driver
+- * checks the ones a new request names here.
++ * airoha_pon_set_gems(), airoha_pon_set_rules() and airoha_pon_set_table()
++ * take any ifindex, since a device can go while a table naming it is in
++ * use; a PON MAC driver checks the ones a new request names here.
+  *
+  * Return: 0 when @ifindex is 0 or an ANI port device of @pon now, -EINVAL
+  * otherwise.
+diff --git a/include/linux/soc/airoha/airoha_pon.h b/include/linux/soc/airoha/airoha_pon.h
+index 36207f8..85e2720 100644
+--- a/include/linux/soc/airoha/airoha_pon.h
++++ b/include/linux/soc/airoha/airoha_pon.h
+@@ -117,6 +117,11 @@ int airoha_pon_set_gems(struct airoha_pon *pon,
+ 			const struct airoha_pon_gem *gems, unsigned int n);
+ int airoha_pon_set_rules(struct airoha_pon *pon,
+ 			 const struct airoha_pon_rule *rules, unsigned int n);
++int airoha_pon_set_table(struct airoha_pon *pon,
++			 const struct airoha_pon_gem *gems,
++			 unsigned int num_gems,
++			 const struct airoha_pon_rule *rules,
++			 unsigned int num_rules);
+ int airoha_pon_check_ifindex(struct airoha_pon *pon, int ifindex);
+ int airoha_pon_tcont_open(struct airoha_pon *pon, unsigned int tcont,
+ 			  u32 flags);
