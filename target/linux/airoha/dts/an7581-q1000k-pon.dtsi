@@ -1,0 +1,110 @@
+// SPDX-License-Identifier: (GPL-2.0-only OR MIT)
+/*
+ * Quantum Fiber Q1000K: the PON uplink, GPON or XGS-PON, through the EN7581
+ * PON PHY and PON MAC drivers. The board has one optic per line mode behind
+ * one fibre; the MAC powers the one it runs and picks by which sees light.
+ *
+ * Included at the end of an7581-q1000k.dts, which disables the PON PCS and
+ * GMAC port 2: the PON PHY drives the PON serdes instead of the PCS, and
+ * port 2 becomes the PON interface.
+ *
+ * The optics share one EN7572 laser driver on i2c0, the MAC's second PHY.
+ * Its two calibration tables are factory data in the vendor's "dsd" store,
+ * which sits inside the read-only "vendor" partition at 0x400000.
+ */
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+#include <dt-bindings/reset/airoha,en7581-reset.h>
+
+/ {
+	soc {
+		en7581_pon_phy: phy@1fa8a000 {
+			compatible = "airoha,en7581-pon-phy";
+			reg = <0x0 0x1fa8a000 0x0 0x2000>,
+			      <0x0 0x1faf0000 0x0 0x1000>;
+			reg-names = "serdes", "line";
+			airoha,system-controller = <&scuclk>;
+			airoha,chip-controller = <&chip_scu>;
+			resets = <&scuclk EN7581_XPON_PHY_RST>;
+			tx-disable-gpios = <&en7581_pinctrl 38 GPIO_ACTIVE_HIGH>;
+			#phy-cells = <0>;
+		};
+
+		en7581_pon_mac: pon-mac@1fb64000 {
+			compatible = "airoha,en7581-pon-mac";
+			reg = <0x0 0x1fb64000 0x0 0x1000>,
+			      <0x0 0x1fb65000 0x0 0x1000>;
+			reg-names = "gpon", "xgspon";
+			interrupts = <GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 34 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-names = "mac", "power-fail";
+			resets = <&scuclk EN7581_XPON_MAC_RST>;
+			phys = <&en7581_pon_phy>, <&en7572>;
+			airoha,system-controller = <&scuclk>;
+			airoha,pon-port = <&gdm2>;
+			optic-power-gpios = <&en7581_pinctrl 9 GPIO_ACTIVE_LOW>,
+					    <&en7581_pinctrl 8 GPIO_ACTIVE_LOW>;
+			optic-select-gpios = <&en7581_pinctrl 45 GPIO_ACTIVE_HIGH>,
+					     <&en7581_pinctrl 46 GPIO_ACTIVE_HIGH>;
+			los-gpios = <&en7581_pinctrl 10 GPIO_ACTIVE_HIGH>,
+				    <&en7581_pinctrl 11 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
+
+&i2c0 {
+	status = "okay";
+
+	en7572: laser-driver@50 {
+		compatible = "airoha,en7572";
+		reg = <0x50>;
+		nvmem-cells = <&en7572_cal_gpon>, <&en7572_cal_xgspon>;
+		nvmem-cell-names = "calibration-gpon", "calibration-xgspon";
+		#phy-cells = <0>;
+	};
+};
+
+/* the "vendor" partition */
+&vendor {
+	en7572_cal_layout: nvmem-layout {
+		compatible = "fixed-layout";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		en7572_cal_gpon: calibration@411000 {
+			reg = <0x411000 0x200>;
+		};
+
+		en7572_cal_xgspon: calibration@412000 {
+			reg = <0x412000 0x200>;
+		};
+	};
+};
+
+&gdm2 {
+	/delete-property/ pcs-handle;
+	airoha,pon;
+	status = "okay";
+
+	/* the name airoha-omci's helpers and airoha-pon-ani links give the PON interface */
+	openwrt,netdev-name = "pon";
+};
+
+/*
+ * The two lights on the fibre connector. The activity light blinks while
+ * frames pass through the PON interface: the netdev trigger, whose device
+ * and tx/rx modes a devicetree cannot give, so the board LED setup sets them.
+ */
+&{/leds/led-4} {
+	linux,default-trigger = "netdev";
+};
+
+/* the link light: on once the ONU has found the downstream */
+&{/leds/led-5} {
+	linux,default-trigger = "pon-link";
+};
+
+/*
+ * led-6, the red lamp on the same connector, keeps no trigger: the PON MAC
+ * never lights it, and in service it is dark.
+ */

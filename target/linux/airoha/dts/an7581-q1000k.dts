@@ -141,7 +141,7 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 
-		partition@0 {
+		vendor: partition@0 {
 			label = "vendor";
 			reg = <0x00000000 0x00600000>;
 			read-only;
@@ -205,7 +205,7 @@
 	status = "okay";
 };
 
-/* Optical uplink; enable once the PON data path is supported. */
+/* Optical uplink configuration is in an7581-q1000k-pon.dtsi. */
 &pon_pcs {
 	status = "disabled";
 };
@@ -264,3 +264,5 @@
 	pinctrl-names = "default";
 	pinctrl-0 = <&uart2_pins>;
 };
+
+#include "an7581-q1000k-pon.dtsi"
