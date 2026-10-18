@@ -1,0 +1,170 @@
+From: John Morkel <john@morkel.me>
+Date: Thu, 8 Oct 2026 23:01:00 -0700
+Subject: [PATCH] net: airoha: split the TX descriptor fill out of ndo_start_xmit
+
+airoha_dev_xmit() builds the two message words of a frame and then
+fills the QDMA TX descriptors for it. Move the second half into
+airoha_qdma_tx_skb(), which takes the QDMA, the ring, both message words
+and whether more frames follow, so that a caller other than
+ndo_start_xmit can queue a frame on a ring of its choosing. The PON mode
+later in this series sends its control frames that way.
+
+No functional change.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index c477564..9dcdd07 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2619,54 +2619,19 @@ static int airoha_dev_set_features(struct net_device *netdev,
+ 	return 0;
+ }
+ 
+-static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
+-				   struct net_device *netdev)
++static netdev_tx_t airoha_qdma_tx_skb(struct airoha_qdma *qdma,
++				      struct sk_buff *skb,
++				      struct net_device *netdev, int qid,
++				      u32 msg0, u32 msg1, bool more)
+ {
+-	struct airoha_gdm_dev *dev = netdev_priv(netdev);
+-	u32 nr_frags, tag, msg0, msg1, len;
+ 	struct airoha_queue_entry *e;
+-	struct airoha_qdma *qdma;
+ 	struct netdev_queue *txq;
+ 	struct airoha_queue *q;
+ 	LIST_HEAD(tx_list);
++	u32 nr_frags, len;
+ 	dma_addr_t addr;
+-	int i = 0, qid;
++	int i = 0;
+ 	u16 index;
+-	u8 fport;
+-
+-	rcu_read_lock();
+-	qdma = rcu_dereference(dev->qdma);
+-	qid = airoha_qdma_get_txq(qdma, skb_get_queue_mapping(skb));
+-	tag = airoha_get_dsa_tag(skb, netdev);
+-
+-	msg0 = FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK,
+-			  qid / AIROHA_NUM_QOS_QUEUES) |
+-	       FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK,
+-			  qid % AIROHA_NUM_QOS_QUEUES) |
+-	       FIELD_PREP(QDMA_ETH_TXMSG_SP_TAG_MASK, tag);
+-	if (skb->ip_summed == CHECKSUM_PARTIAL)
+-		msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_TCO_MASK, 1) |
+-			FIELD_PREP(QDMA_ETH_TXMSG_UCO_MASK, 1) |
+-			FIELD_PREP(QDMA_ETH_TXMSG_ICO_MASK, 1);
+-
+-	/* TSO: fill MSS info in tcp checksum field */
+-	if (skb_is_gso(skb)) {
+-		if (skb_cow_head(skb, 0))
+-			goto error;
+-
+-		if (skb_shinfo(skb)->gso_type & (SKB_GSO_TCPV4 |
+-						 SKB_GSO_TCPV6)) {
+-			__be16 csum = cpu_to_be16(skb_shinfo(skb)->gso_size);
+-
+-			tcp_hdr(skb)->check = (__force __sum16)csum;
+-			msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_TSO_MASK, 1);
+-		}
+-	}
+-
+-	fport = airoha_get_fe_port(dev);
+-	msg1 = FIELD_PREP(QDMA_ETH_TXMSG_NBOQ_MASK, dev->nbq) |
+-	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, fport) |
+-	       FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f);
+ 
+ 	q = &qdma->q_tx[qid];
+ 	if (WARN_ON_ONCE(!q->ndesc))
+@@ -2685,7 +2650,6 @@ static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
+ 		netif_tx_stop_queue(txq);
+ 		q->txq_stopped = true;
+ 		spin_unlock_bh(&q->lock);
+-		rcu_read_unlock();
+ 
+ 		return NETDEV_TX_BUSY;
+ 	}
+@@ -2746,22 +2710,78 @@ static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
+ 		q->txq_stopped = true;
+ 	}
+ 
+-	if (netif_xmit_stopped(txq) || !netdev_xmit_more())
++	if (netif_xmit_stopped(txq) || !more)
+ 		airoha_qdma_rmw(qdma, REG_TX_CPU_IDX(qid),
+ 				TX_RING_CPU_IDX_MASK,
+ 				FIELD_PREP(TX_RING_CPU_IDX_MASK, index));
+ 
+ 	spin_unlock_bh(&q->lock);
+-	rcu_read_unlock();
+ 
+ 	return NETDEV_TX_OK;
+ 
+ error_unmap:
+ 	list_for_each_entry(e, &tx_list, list)
+-		airoha_unmap_xmit_buf(dev->eth, e);
++		airoha_unmap_xmit_buf(qdma->eth, e);
+ 	list_splice(&tx_list, &q->tx_list);
+ error_unlock:
+ 	spin_unlock_bh(&q->lock);
++error:
++	dev_kfree_skb_any(skb);
++	netdev->stats.tx_dropped++;
++
++	return NETDEV_TX_OK;
++}
++
++static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
++				   struct net_device *netdev)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	struct airoha_qdma *qdma;
++	u32 tag, msg0, msg1;
++	netdev_tx_t ret;
++	int qid;
++	u8 fport;
++
++	rcu_read_lock();
++	qdma = rcu_dereference(dev->qdma);
++	qid = airoha_qdma_get_txq(qdma, skb_get_queue_mapping(skb));
++	tag = airoha_get_dsa_tag(skb, netdev);
++
++	msg0 = FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK,
++			  qid / AIROHA_NUM_QOS_QUEUES) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK,
++			  qid % AIROHA_NUM_QOS_QUEUES) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_SP_TAG_MASK, tag);
++	if (skb->ip_summed == CHECKSUM_PARTIAL)
++		msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_TCO_MASK, 1) |
++			FIELD_PREP(QDMA_ETH_TXMSG_UCO_MASK, 1) |
++			FIELD_PREP(QDMA_ETH_TXMSG_ICO_MASK, 1);
++
++	/* TSO: fill MSS info in tcp checksum field */
++	if (skb_is_gso(skb)) {
++		if (skb_cow_head(skb, 0))
++			goto error;
++
++		if (skb_shinfo(skb)->gso_type & (SKB_GSO_TCPV4 |
++						 SKB_GSO_TCPV6)) {
++			__be16 csum = cpu_to_be16(skb_shinfo(skb)->gso_size);
++
++			tcp_hdr(skb)->check = (__force __sum16)csum;
++			msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_TSO_MASK, 1);
++		}
++	}
++
++	fport = airoha_get_fe_port(dev);
++	msg1 = FIELD_PREP(QDMA_ETH_TXMSG_NBOQ_MASK, dev->nbq) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, fport) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f);
++
++	ret = airoha_qdma_tx_skb(qdma, skb, netdev, qid, msg0, msg1,
++				 netdev_xmit_more());
++	rcu_read_unlock();
++
++	return ret;
++
+ error:
+ 	dev_kfree_skb_any(skb);
+ 	netdev->stats.tx_dropped++;
