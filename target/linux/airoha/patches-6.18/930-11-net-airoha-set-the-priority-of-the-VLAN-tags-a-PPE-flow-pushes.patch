@@ -1,0 +1,39 @@
+From: John Morkel <john@morkel.me>
+Date: Fri, 9 Oct 2026 11:40:00 -0700
+Subject: [PATCH] net: airoha: set the priority of the VLAN tags a PPE flow
+ pushes
+
+The vlan1 and vlan2 words of a FOE entry hold the TCI of the tags the
+entry pushes: the vendor SDK writes there the whole TCI it parsed from
+the frame, priority included. airoha_ppe writes the VLAN ID alone, so a
+flow offloaded from a vlan push action that sets a priority leaves the
+PPE with PCP 0, where the same flow on the CPU leaves with the priority
+it asked for. On a PON uplink that priority is part of what the OLT
+provisions, and it can select the GEM port of the flow.
+
+Put each push's priority into its TCI. A push without a priority, such
+as every one the netfilter flowtable offloads, keeps PCP 0.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 99e9183..03d8eec 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -465,10 +465,14 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 					    data->pppoe.sid);
+ 	}
+ 
++	/* vlan1 and vlan2 are the whole TCI of the pushed tags */
+ 	if (data->vlan.num) {
+-		l2->vlan1 = data->vlan.hdr[0].id;
++		l2->vlan1 = data->vlan.hdr[0].id |
++			    FIELD_PREP(VLAN_PRIO_MASK, data->vlan.hdr[0].prio);
+ 		if (data->vlan.num == 2)
+-			l2->vlan2 = data->vlan.hdr[1].id;
++			l2->vlan2 = data->vlan.hdr[1].id |
++				    FIELD_PREP(VLAN_PRIO_MASK,
++					       data->vlan.hdr[1].prio);
+ 	}
+ 
+ 	if (wlan_etype >= 0) {
