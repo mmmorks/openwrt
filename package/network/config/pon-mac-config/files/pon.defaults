@@ -1,0 +1,35 @@
+#!/bin/sh
+# First boot: take the ONU serial number from the board's factory identity store, unless
+# /etc/config/pon already holds one. The store is plain-text key=value lines; its record
+# offsets differ per unit, so the serial is found by its key.
+
+. /lib/functions.sh
+
+[ -n "$(uci -q get pon.mac.serial_number)" ] && exit 0
+
+# store_serial <partition> <offset in 64 KiB blocks>: print the serial record of a store there.
+# The whole store is searched, 2 MiB: where the record sits in it varies.
+store_serial() {
+	local idx sn
+
+	idx="$(find_mtd_index "$1")"
+	[ -n "$idx" ] || return 1
+	sn="$(dd if="/dev/mtd$idx" bs=65536 skip="$2" count=32 2>/dev/null |
+		LC_ALL=C tr '\377\000' '\n\n' | sed -n 's/^fsan=//p' | head -n 1)"
+	echo "$sn" | grep -qE '^[[:graph:]]{4}[0-9A-Fa-f]{8}$' || return 1
+	echo "$sn"
+}
+
+sn=
+case "$(board_name)" in
+quantum,q1000k*)
+	# at flash offset 0x400000: a partition of its own under the stock layout, 64 blocks
+	# into the first partition under OpenWrt's
+	sn="$(store_serial dsd 0 || store_serial vendor 64)"
+	;;
+esac
+
+[ -n "$sn" ] || exit 0
+uci -q set pon.mac.serial_number="$sn"
+uci commit pon
+exit 0

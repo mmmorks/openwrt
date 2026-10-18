@@ -1,0 +1,64 @@
+#!/bin/sh /etc/rc.common
+# Set the EN7581 PON MAC's ONU identity and line mode from /etc/config/pon, and start it.
+
+START=60
+STOP=90
+USE_PROCD=1
+
+pon_dir() {
+	local d
+
+	for d in /sys/bus/platform/drivers/airoha-pon-mac/*; do
+		[ -e "$d/enable" ] && { echo "$d"; return 0; }
+	done
+	return 1
+}
+
+# pon_set <dir> <attribute> <value>: write the attribute when the value is set
+pon_set() {
+	[ -n "$3" ] || return 0
+	printf '%s\n' "$3" > "$1/$2" || logger -t pon "cannot set $2"
+}
+
+start_service() {
+	local dir enabled line_mode serial_number password registration_id
+
+	dir="$(pon_dir)" || return 0
+	config_load pon
+	config_get_bool enabled mac enabled 0
+	[ "$enabled" = 1 ] || return 0
+	config_get line_mode mac line_mode gpon
+	config_get serial_number mac serial_number
+	config_get password mac password
+	config_get registration_id mac registration_id
+
+	if [ -z "$serial_number" ]; then
+		logger -t pon "no serial number in /etc/config/pon, not starting"
+		return 0
+	fi
+
+	echo 0 > "$dir/enable"
+	pon_set "$dir" serial_number "$serial_number"
+	pon_set "$dir" password "$password"
+	pon_set "$dir" registration_id "$registration_id"
+	pon_set "$dir" line_mode "$line_mode"
+
+	# in auto mode a start first tests both optics for light, which takes seconds
+	( echo 1 > "$dir/enable" || logger -t pon "the PON MAC did not start" ) &
+}
+
+stop_service() {
+	local dir
+
+	dir="$(pon_dir)" || return 0
+	echo 0 > "$dir/enable"
+}
+
+reload_service() {
+	stop
+	start
+}
+
+service_triggers() {
+	procd_add_reload_trigger pon
+}
