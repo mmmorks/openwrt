@@ -1,0 +1,986 @@
+From: John Morkel <john@morkel.me>
+Date: Sat, 10 Oct 2026 18:00:00 -0700
+Subject: [PATCH] net: airoha: add ANI port devices on a PON interface
+
+A PON interface carries the GEM ports of every ANI-side bridge port the
+OLT provisions (G.988 ME 47 pointing to a GEM interworking TP, an 802.1p
+mapper or a multicast GEM interworking TP), but delivers all of them on
+one netdev and picks an upstream GEM port by one rule list. Nothing can
+then bridge, filter or police one ANI port's GEM ports apart from
+another's.
+
+Add a link kind, airoha-pon-ani, for a netdev stacked on a PON interface:
+
+  ip link add pon-ani1 link pon type airoha-pon-ani
+
+It has no attributes of its own. The PON table says what it carries: a
+GEM port entry and a rule each gain the ifindex of their ANI port device,
+0 for the PON interface itself. airoha_pon_check_ifindex() tells a PON
+MAC driver whether an ifindex is one of these, for the requests it
+takes. airoha_pon_set_gems() and airoha_pon_set_rules() take any
+ifindex: a device can be removed while the driver's table still names
+it, and refusing that table would keep the old one through every later
+change, such as an Alloc-ID the OLT assigns. A GEM port of a device that
+does not exist drops its frames, and a rule of one matches none. A table
+that names no device behaves as before.
+
+Receive: a data frame of a GEM port bound to a device is delivered on
+that device. While the device does not exist or is down, the frame is
+dropped rather than delivered on the PON interface.
+
+Transmit: the device picks a frame's GEM port by its own rules, and the
+PON interface's rules no longer match its frames. It has one TX queue
+per T-CONT queue and sends on the PON interface's TX rings, with the same
+message words; a full ring stops its queues and a completion wakes them
+as it does the PON interface's. A frame on a ring holds its device until
+the ring is done with it, so that a device being removed waits for its
+frames rather than leaving the completion a freed netdev. The device keeps
+software counters; the GDM's hardware counters count its frames too.
+
+Offload: a flow towards a device is bound like one towards the PON
+interface, with the device's rules, and the device binds a flowtable to
+the PPE through the PON interface's block callback. It does not answer
+ndo_fill_forward_path with the PON interface: a flowtable would then
+send its frames on the PON interface directly, past the device and with
+the interface's rules. Removing a device unbinds the flows towards the
+PON, as a table change does.
+
+The device inherits its link's address, MTU and features but for
+hardware tc, stays in its link's network namespace, since the table
+names it by its ifindex, follows its link's carrier while the link runs,
+and is removed with it.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -990,7 +990,8 @@
+ 			}
+ 		}
+ 
+-		q->skb->protocol = eth_type_trans(q->skb, netdev);
++		/* a PON frame may be delivered on an ANI port device */
++		q->skb->protocol = eth_type_trans(q->skb, q->skb->dev);
+ 		hash = FIELD_GET(AIROHA_RXD4_FOE_ENTRY, msg1);
+ 		if (hash != AIROHA_RXD4_FOE_ENTRY)
+ 			skb_set_hash(q->skb, jhash_1word(hash, 0),
+@@ -1170,6 +1171,35 @@
+ 	return 0;
+ }
+ 
++static const struct net_device_ops airoha_netdev_ops;
++
++/* A frame on a TX ring is done: report it to BQL and free it. A frame of a
++ * device stacked on a GDM device (a PON ANI port device) held that device
++ * while it was on the ring.
++ */
++static void airoha_qdma_tx_done(struct sk_buff *skb)
++{
++	struct net_device *netdev = skb->dev;
++	struct netdev_queue *txq;
++
++	txq = skb_get_tx_queue(netdev, skb);
++	if (netdev->netdev_ops == &airoha_netdev_ops) {
++		struct airoha_gdm_dev *dev = netdev_priv(netdev);
++		u16 qidx = skb_get_queue_mapping(skb);
++
++		spin_lock_bh(&dev->txq_lock[qidx]);
++		netdev_tx_completed_queue(txq, 1, skb->len);
++		spin_unlock_bh(&dev->txq_lock[qidx]);
++		dev_kfree_skb_any(skb);
++		return;
++	}
++
++	/* the PON interface's QDMA alone sends an ANI port device's frames */
++	netdev_tx_completed_queue(txq, 1, skb->len);
++	dev_kfree_skb_any(skb);
++	dev_put(netdev);
++}
++
+ static void airoha_qdma_wake_netdev_txqs(struct airoha_queue *q)
+ {
+ 	struct airoha_qdma *qdma = q->qdma;
+@@ -1204,6 +1234,8 @@
+ 
+ 			if (dev->pon && qid == AIROHA_PON_CTRL_RING)
+ 				airoha_pon_ctrl_tx_wake(dev->pon);
++			else if (dev->pon)
++				airoha_pon_wake_ani_txqs(dev->pon, qid);
+ 		}
+ 	}
+ 	q->txq_stopped = false;
+@@ -1297,19 +1329,8 @@
+ 		WRITE_ONCE(desc->msg1, 0);
+ 		q->queued--;
+ 
+-		if (skb) {
+-			struct airoha_gdm_dev *dev = netdev_priv(skb->dev);
+-			u16 qidx = skb_get_queue_mapping(skb);
+-			struct netdev_queue *txq;
+-
+-			txq = skb_get_tx_queue(skb->dev, skb);
+-
+-			spin_lock_bh(&dev->txq_lock[qidx]);
+-			netdev_tx_completed_queue(txq, 1, skb->len);
+-			spin_unlock_bh(&dev->txq_lock[qidx]);
+-
+-			dev_kfree_skb_any(skb);
+-		}
++		if (skb)
++			airoha_qdma_tx_done(skb);
+ 
+ 		if (q->txq_stopped && q->ndesc - q->queued >= q->free_thr) {
+ 			/* Since multiple net_device TX queues can share the
+@@ -1479,11 +1500,7 @@
+ 			WRITE_ONCE(desc->msg2, 0);
+ 
+ 			if (skb) {
+-				struct netdev_queue *txq;
+-
+-				txq = skb_get_tx_queue(skb->dev, skb);
+-				netdev_tx_completed_queue(txq, 1, skb->len);
+-				dev_kfree_skb_any(skb);
++				airoha_qdma_tx_done(skb);
+ 				e->skb = NULL;
+ 			}
+ 
+@@ -2565,7 +2582,7 @@
+ 
+ 	/* On a PON port the queue is the frame's GEM port's */
+ 	if (dev->pon)
+-		return airoha_pon_select_queue(dev->pon, skb);
++		return airoha_pon_select_queue(dev->pon, netdev, skb);
+ 
+ 	/* For dsa device select QoS channel according to the dsa user port
+ 	 * index, rely on port id otherwise. Select QoS queue based on the
+@@ -2739,6 +2756,9 @@
+ 		e->dma_type = AIROHA_DMA_MAP_PAGE;
+ 	}
+ 	q->queued += i;
++	/* a stacked device stays until its frames have left the ring */
++	if (netdev->netdev_ops != &airoha_netdev_ops)
++		dev_hold(netdev);
+ 
+ 	skb_tx_timestamp(skb);
+ 	netdev_tx_sent_queue(txq, skb->len);
+@@ -2769,10 +2789,13 @@
+ 	return NETDEV_TX_OK;
+ }
+ 
+-static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
+-				   struct net_device *netdev)
+-{
+-	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++/* Send @skb on @dev's QDMA. @netdev is the device it was sent on: @dev's
++ * own, or an ANI port device stacked on @dev's PON interface.
++ */
++netdev_tx_t airoha_gdm_dev_xmit(struct airoha_gdm_dev *dev,
++				struct sk_buff *skb, struct net_device *netdev)
++{
++	unsigned int len = skb->len;
+ 	struct airoha_qdma *qdma;
+ 	u32 tag, msg0, msg1;
+ 	netdev_tx_t ret;
+@@ -2813,12 +2836,17 @@
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, fport) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f);
+ 
+-	if (dev->pon && airoha_pon_tx_msg(dev->pon, skb, &msg0, &msg1))
++	if (dev->pon && airoha_pon_tx_msg(dev->pon, netdev, skb, &msg0, &msg1))
+ 		goto error;
+ 
+ 	ret = airoha_qdma_tx_skb(qdma, skb, netdev, qid, msg0, msg1,
+ 				 netdev_xmit_more());
+ 	rcu_read_unlock();
++
++	/* the GDM counts its own frames; a device stacked on it does not */
++	if (ret == NETDEV_TX_OK &&
++	    netdev->pcpu_stat_type == NETDEV_PCPU_STAT_TSTATS)
++		dev_sw_netstats_tx_add(netdev, 1, len);
+ 
+ 	return ret;
+ 
+@@ -2828,6 +2856,12 @@
+ 	rcu_read_unlock();
+ 
+ 	return NETDEV_TX_OK;
++}
++
++static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
++				   struct net_device *netdev)
++{
++	return airoha_gdm_dev_xmit(netdev_priv(netdev), skb, netdev);
+ }
+ 
+ static void airoha_ethtool_get_drvinfo(struct net_device *netdev,
+@@ -3542,8 +3576,8 @@
+ 	}
+ }
+ 
+-static int airoha_dev_setup_tc_block(struct net_device *dev,
+-				     struct flow_block_offload *f)
++int airoha_dev_setup_tc_block(struct net_device *dev,
++			      struct flow_block_offload *f)
+ {
+ 	flow_setup_cb_t *cb = airoha_dev_setup_tc_block_cb;
+ 	static LIST_HEAD(block_cb_list);
+@@ -3848,6 +3882,19 @@
+ 
+ 		dst_release(&port->dsa_meta[i]->dst);
+ 	}
++}
++
++/* The PON interface @netdev is, or NULL */
++struct airoha_pon *airoha_dev_pon(const struct net_device *netdev)
++{
++	const struct airoha_gdm_dev *dev;
++
++	if (netdev->netdev_ops != &airoha_netdev_ops)
++		return NULL;
++
++	dev = netdev_priv(netdev);
++
++	return dev->pon;
+ }
+ 
+ bool airoha_is_valid_gdm_dev(struct airoha_eth *eth,
+@@ -4578,7 +4625,29 @@
+ 		.of_match_table = of_airoha_match,
+ 	},
+ };
+-module_platform_driver(airoha_driver);
++
++static int __init airoha_eth_init(void)
++{
++	int err;
++
++	err = airoha_pon_ani_register();
++	if (err)
++		return err;
++
++	err = platform_driver_register(&airoha_driver);
++	if (err)
++		airoha_pon_ani_unregister();
++
++	return err;
++}
++module_init(airoha_eth_init);
++
++static void __exit airoha_eth_exit(void)
++{
++	platform_driver_unregister(&airoha_driver);
++	airoha_pon_ani_unregister();
++}
++module_exit(airoha_eth_exit);
+ 
+ MODULE_LICENSE("GPL v2");
+ MODULE_AUTHOR("Lorenzo Bianconi <lorenzo@kernel.org>");
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -555,6 +555,7 @@
+ 
+ 	/* a flow towards a PON port: what its GEM port is looked up by */
+ 	struct airoha_pon *pon;
++	int pon_ifindex;
+ 	u16 pon_vid;
+ 	u8 pon_pcp;
+ 
+@@ -641,6 +642,15 @@
+ struct airoha_pon_client;
+ struct airoha_pon_map;
+ 
++/* an ANI port device: a netdev stacked on the PON interface that the PON
++ * table binds GEM ports and upstream rules to
++ */
++struct airoha_pon_ani {
++	struct airoha_pon *pon;
++	struct net_device *netdev;
++	struct list_head list;
++};
++
+ struct airoha_pon {
+ 	struct airoha_gdm_dev *dev;
+ 	struct airoha_qdma *qdma;
+@@ -650,6 +660,8 @@
+ 	struct mutex lock;
+ 	struct airoha_pon_client __rcu *client;
+ 	struct airoha_pon_map __rcu *map;
++	/* ANI port devices, changed under RTNL and ->lock, read under RCU */
++	struct list_head anis;
+ 
+ 	/* open T-CONTs */
+ 	DECLARE_BITMAP(tconts, AIROHA_PON_NUM_TCONTS);
+@@ -816,20 +828,30 @@
+ netdev_tx_t airoha_qdma_tx_skb(struct airoha_qdma *qdma, struct sk_buff *skb,
+ 			       struct net_device *netdev, int qid, u32 msg0,
+ 			       u32 msg1, bool more);
++netdev_tx_t airoha_gdm_dev_xmit(struct airoha_gdm_dev *dev,
++				struct sk_buff *skb, struct net_device *netdev);
++int airoha_dev_setup_tc_block(struct net_device *dev,
++			      struct flow_block_offload *f);
+ 
+ int airoha_pon_alloc(struct airoha_gdm_dev *dev);
+ int airoha_pon_init(struct airoha_gdm_dev *dev);
+ void airoha_pon_start(struct airoha_pon *pon);
+ void airoha_pon_stop(struct airoha_pon *pon);
+ void airoha_pon_free(struct airoha_pon *pon);
+-u16 airoha_pon_select_queue(struct airoha_pon *pon, struct sk_buff *skb);
+-int airoha_pon_tx_msg(struct airoha_pon *pon, struct sk_buff *skb, u32 *msg0,
+-		      u32 *msg1);
++u16 airoha_pon_select_queue(struct airoha_pon *pon, struct net_device *netdev,
++			    struct sk_buff *skb);
++int airoha_pon_tx_msg(struct airoha_pon *pon, struct net_device *netdev,
++		      struct sk_buff *skb, u32 *msg0, u32 *msg1);
+ void airoha_pon_ctrl_tx_wake(struct airoha_pon *pon);
++void airoha_pon_wake_ani_txqs(struct airoha_pon *pon, int qid);
+ int airoha_pon_rx(struct airoha_pon *pon, struct sk_buff *skb, u32 msg0,
+ 		  u32 msg1);
+-int airoha_pon_resolve(struct airoha_pon *pon, u16 vid, u8 pcp,
++int airoha_pon_resolve(struct airoha_pon *pon, int ifindex, u16 vid, u8 pcp,
+ 		       struct airoha_pon_gem *gem);
++int airoha_pon_ani_lower(struct net_device **netdev);
++struct airoha_pon *airoha_dev_pon(const struct net_device *netdev);
++int airoha_pon_ani_register(void);
++void airoha_pon_ani_unregister(void);
+ 
+ void airoha_ppe_set_xmit_frame_size(struct airoha_gdm_dev *dev);
+ void airoha_ppe_set_cpu_port(struct airoha_gdm_dev *dev, u8 ppe_id, u8 fport);
+diff --git a/drivers/net/ethernet/airoha/airoha_pon.c b/drivers/net/ethernet/airoha/airoha_pon.c
+--- a/drivers/net/ethernet/airoha/airoha_pon.c
++++ b/drivers/net/ethernet/airoha/airoha_pon.c
+@@ -5,12 +5,14 @@
+  */
+ #include <linux/bsearch.h>
+ #include <linux/delay.h>
++#include <linux/etherdevice.h>
+ #include <linux/if_vlan.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_platform.h>
+ #include <linux/platform_device.h>
+ #include <linux/sort.h>
++#include <net/rtnetlink.h>
+ 
+ #include "airoha_regs.h"
+ #include "airoha_eth.h"
+@@ -84,6 +86,7 @@
+ 
+ 	pon->dev = dev;
+ 	mutex_init(&pon->lock);
++	INIT_LIST_HEAD(&pon->anis);
+ 	dev->pon = pon;
+ 
+ 	return 0;
+@@ -339,6 +342,33 @@
+ 	return (int)ga->port_id - (int)gb->port_id;
+ }
+ 
++/* The ANI port device @ifindex of @pon; call it under RCU or ->lock. */
++static struct airoha_pon_ani *airoha_pon_find_ani(struct airoha_pon *pon,
++						  int ifindex)
++{
++	struct airoha_pon_ani *ani;
++
++	list_for_each_entry_rcu(ani, &pon->anis, list,
++				lockdep_is_held(&pon->lock))
++		if (ani->netdev->ifindex == ifindex)
++			return ani;
++
++	return NULL;
++}
++
++/* Whether @ifindex is 0 or an ANI port device; call it with ->lock held. */
++static bool airoha_pon_ifindex_ok(struct airoha_pon *pon, int ifindex)
++{
++	return !ifindex || airoha_pon_find_ani(pon, ifindex);
++}
++
++/* The ifindex the PON table names @netdev by: 0 for the PON interface */
++static int airoha_pon_dev_ifindex(struct airoha_pon *pon,
++				  const struct net_device *netdev)
++{
++	return netdev == netdev_from_priv(pon->dev) ? 0 : netdev->ifindex;
++}
++
+ /* Replace the GEM table or the rule table; a negative count keeps it. */
+ static int airoha_pon_replace_map(struct airoha_pon *pon,
+ 				  const struct airoha_pon_gem *gems,
+@@ -388,7 +418,10 @@
+  * @n: its length, at most AIROHA_PON_MAX_GEMS
+  *
+  * Downstream frames on a GEM port the table does not mark
+- * AIROHA_PON_GEM_DOWNSTREAM are dropped.
++ * AIROHA_PON_GEM_DOWNSTREAM are dropped. The others are delivered on the
++ * device the GEM port names; while that device does not exist or is down,
++ * they are dropped. A GEM port may name a device removed since the caller
++ * made its table, so this takes any ifindex.
+  *
+  * Return: 0, or -EINVAL when a GEM port ID repeats, is 0xffff, or names a
+  * T-CONT past AIROHA_PON_NUM_TCONTS or a queue past AIROHA_PON_TCONT_QUEUES.
+@@ -443,6 +476,9 @@
+  * @rules: the new rules, in match order
+  * @n: their number, at most AIROHA_PON_MAX_RULES
+  *
++ * A rule naming a device that does not exist, such as one removed since
++ * the caller made its rules, matches no frame.
++ *
+  * Return: 0, or -EINVAL for a VLAN ID or PCP out of range.
+  */
+ int airoha_pon_set_rules(struct airoha_pon *pon,
+@@ -473,6 +509,30 @@
+ 	return err;
+ }
+ EXPORT_SYMBOL_GPL(airoha_pon_set_rules);
++
++/**
++ * airoha_pon_check_ifindex() - check a device a request names
++ * @pon: the interface
++ * @ifindex: an ANI port device's ifindex, or 0 for the interface itself
++ *
++ * airoha_pon_set_gems() and airoha_pon_set_rules() take any ifindex, since
++ * a device can go while a table naming it is in use; a PON MAC driver
++ * checks the ones a new request names here.
++ *
++ * Return: 0 when @ifindex is 0 or an ANI port device of @pon now, -EINVAL
++ * otherwise.
++ */
++int airoha_pon_check_ifindex(struct airoha_pon *pon, int ifindex)
++{
++	bool ok;
++
++	mutex_lock(&pon->lock);
++	ok = airoha_pon_ifindex_ok(pon, ifindex);
++	mutex_unlock(&pon->lock);
++
++	return ok ? 0 : -EINVAL;
++}
++EXPORT_SYMBOL_GPL(airoha_pon_check_ifindex);
+ 
+ static void airoha_pon_close_queues(struct airoha_pon *pon,
+ 				    unsigned int tcont, bool close)
+@@ -894,16 +954,19 @@
+ 		       airoha_pon_gem_cmp);
+ }
+ 
+-/* The GEM port entry of an upstream frame, with an open T-CONT; call it
+- * under RCU.
+- */
+-int airoha_pon_resolve(struct airoha_pon *pon, u16 vid, u8 pcp,
++/* The GEM port entry of an upstream frame sent on the device @ifindex
++ * names (0 for the PON interface), with an open T-CONT; call it under RCU.
++ */
++int airoha_pon_resolve(struct airoha_pon *pon, int ifindex, u16 vid, u8 pcp,
+ 		       struct airoha_pon_gem *out)
+ {
+ 	const struct airoha_pon_gem *gem = NULL;
+ 	const struct airoha_pon_map *map;
+ 	unsigned int i;
+ 
++	if (ifindex && !airoha_pon_find_ani(pon, ifindex))
++		return -ENODEV;
++
+ 	map = rcu_dereference(pon->map);
+ 	if (!map)
+ 		return -ENOENT;
+@@ -911,6 +974,9 @@
+ 	for (i = 0; i < map->num_rules; i++) {
+ 		const struct airoha_pon_rule *rule = &map->rules[i];
+ 
++		if (rule->ifindex != ifindex)
++			continue;
++
+ 		if (rule->vid != AIROHA_PON_VID_ANY && rule->vid != vid)
+ 			continue;
+ 
+@@ -932,10 +998,12 @@
+ 	return 0;
+ }
+ 
+-/* The GEM port entry of an upstream data frame, from its outer tag;
+- * call it under RCU.
+- */
+-static int airoha_pon_resolve_skb(struct airoha_pon *pon, struct sk_buff *skb,
++/* The GEM port entry of an upstream data frame sent on @netdev, from its
++ * outer tag; call it under RCU.
++ */
++static int airoha_pon_resolve_skb(struct airoha_pon *pon,
++				  struct net_device *netdev,
++				  struct sk_buff *skb,
+ 				  struct airoha_pon_gem *gem)
+ {
+ 	u16 tci, vid = AIROHA_PON_VID_UNTAGGED;
+@@ -946,7 +1014,8 @@
+ 		pcp = (tci & VLAN_PRIO_MASK) >> VLAN_PRIO_SHIFT;
+ 	}
+ 
+-	return airoha_pon_resolve(pon, vid, pcp, gem);
++	return airoha_pon_resolve(pon, airoha_pon_dev_ifindex(pon, netdev), vid,
++				  pcp, gem);
+ }
+ 
+ /* The TX ring of an upstream data frame: the one of its GEM port's queue,
+@@ -954,35 +1023,38 @@
+  * that maps to no GEM port goes on ring 0, and airoha_pon_tx_msg() drops
+  * it.
+  */
+-u16 airoha_pon_select_queue(struct airoha_pon *pon, struct sk_buff *skb)
++u16 airoha_pon_select_queue(struct airoha_pon *pon, struct net_device *netdev,
++			    struct sk_buff *skb)
+ {
+ 	struct airoha_pon_gem gem;
+ 	int err;
+ 
+ 	rcu_read_lock();
+-	err = airoha_pon_resolve_skb(pon, skb, &gem);
++	err = airoha_pon_resolve_skb(pon, netdev, skb, &gem);
+ 	rcu_read_unlock();
+ 
+ 	return err ? 0 : gem.queue;
+ }
+ 
+-/* Fill the GEM port, T-CONT and queue of an upstream data frame into its
+- * TX message words; an error means the frame must be dropped. Called under
+- * RCU.
+- */
+-int airoha_pon_tx_msg(struct airoha_pon *pon, struct sk_buff *skb, u32 *msg0,
+-		      u32 *msg1)
+-{
++/* Fill the GEM port, T-CONT and queue of an upstream data frame sent on
++ * @netdev into its TX message words; an error means the frame must be
++ * dropped. Called under RCU.
++ */
++int airoha_pon_tx_msg(struct airoha_pon *pon, struct net_device *netdev,
++		      struct sk_buff *skb, u32 *msg0, u32 *msg1)
++{
++	struct net_device *lower = netdev_from_priv(pon->dev);
+ 	struct airoha_pon_gem gem;
+ 	int err;
+ 
+-	if (!netif_carrier_ok(netdev_from_priv(pon->dev)))
++	/* an ANI port device can send while the PON interface is down */
++	if (!netif_running(lower) || !netif_carrier_ok(lower))
+ 		return -ENOLINK;
+ 
+ 	if (READ_ONCE(pon->tx_stopped))
+ 		return -EAGAIN;
+ 
+-	err = airoha_pon_resolve_skb(pon, skb, &gem);
++	err = airoha_pon_resolve_skb(pon, netdev, skb, &gem);
+ 	if (err)
+ 		return err;
+ 
+@@ -1011,7 +1083,8 @@
+ }
+ 
+ /* Sort a frame received on the PON port. Return: 0 to deliver it to the
+- * stack, 1 when the PON MAC driver took it, a negative error to drop it.
++ * stack on skb->dev, 1 when the PON MAC driver took it, a negative error
++ * to drop it.
+  */
+ int airoha_pon_rx(struct airoha_pon *pon, struct sk_buff *skb, u32 msg0,
+ 		  u32 msg1)
+@@ -1046,6 +1119,18 @@
+ 		gem = airoha_pon_find_gem(map, port_id);
+ 	if (!gem || !(gem->flags & AIROHA_PON_GEM_DOWNSTREAM))
+ 		goto unlock;
++
++	if (gem->ifindex) {
++		struct airoha_pon_ani *ani;
++
++		/* never on another device than the one it is bound to */
++		ani = airoha_pon_find_ani(pon, gem->ifindex);
++		if (!ani || !netif_running(ani->netdev))
++			goto unlock;
++
++		skb->dev = ani->netdev;
++		dev_sw_netstats_rx_add(ani->netdev, skb->len);
++	}
+ 
+ 	if (skb->ip_summed == CHECKSUM_UNNECESSARY &&
+ 	    !airoha_pon_rx_csum_ok(msg1))
+@@ -1055,6 +1140,20 @@
+ 	rcu_read_unlock();
+ 
+ 	return ret;
++}
++
++/* TX ring @qid has room again: wake the ANI port devices' queue on it */
++void airoha_pon_wake_ani_txqs(struct airoha_pon *pon, int qid)
++{
++	struct airoha_pon_ani *ani;
++
++	if (qid >= AIROHA_PON_TCONT_QUEUES)
++		return;
++
++	rcu_read_lock();
++	list_for_each_entry_rcu(ani, &pon->anis, list)
++		netif_wake_subqueue(ani->netdev, qid);
++	rcu_read_unlock();
+ }
+ 
+ void airoha_pon_ctrl_tx_wake(struct airoha_pon *pon)
+@@ -1137,3 +1236,273 @@
+ 		netif_carrier_off(netdev);
+ }
+ EXPORT_SYMBOL_GPL(airoha_pon_set_carrier);
++
++/* An ANI port device: a G.988 ANI-side bridge port of the PON interface
++ * beyond the one the interface itself is, a GEM interworking TP, 802.1p
++ * mapper or multicast GEM interworking TP. It receives the frames of the
++ * GEM ports the PON table binds to it, and it sends on the GEM ports its own
++ * rules pick, on the PON interface's TX rings.
++ */
++
++static const struct net_device_ops airoha_pon_ani_netdev_ops;
++
++/* the carrier of the PON interface, while it runs */
++static void airoha_pon_ani_carrier(struct net_device *lower,
++				   struct net_device *netdev)
++{
++	if (netif_running(lower) && netif_carrier_ok(lower))
++		netif_carrier_on(netdev);
++	else
++		netif_carrier_off(netdev);
++}
++
++static u16 airoha_pon_ani_select_queue(struct net_device *netdev,
++				       struct sk_buff *skb,
++				       struct net_device *sb_dev)
++{
++	struct airoha_pon_ani *ani = netdev_priv(netdev);
++
++	return airoha_pon_select_queue(ani->pon, netdev, skb);
++}
++
++static netdev_tx_t airoha_pon_ani_xmit(struct sk_buff *skb,
++				       struct net_device *netdev)
++{
++	struct airoha_pon_ani *ani = netdev_priv(netdev);
++
++	return airoha_gdm_dev_xmit(ani->pon->dev, skb, netdev);
++}
++
++static int airoha_pon_ani_get_iflink(const struct net_device *netdev)
++{
++	struct airoha_pon_ani *ani = netdev_priv(netdev);
++
++	return READ_ONCE(netdev_from_priv(ani->pon->dev)->ifindex);
++}
++
++/* A flowtable's flows towards the device are offloaded through the PON
++ * interface's block callback, so a flowtable holding both binds it once.
++ */
++static int airoha_pon_ani_setup_tc(struct net_device *netdev,
++				   enum tc_setup_type type, void *type_data)
++{
++	struct airoha_pon_ani *ani = netdev_priv(netdev);
++
++	if (type != TC_SETUP_FT)
++		return -EOPNOTSUPP;
++
++	return airoha_dev_setup_tc_block(netdev_from_priv(ani->pon->dev),
++					 type_data);
++}
++
++static const struct net_device_ops airoha_pon_ani_netdev_ops = {
++	.ndo_select_queue	= airoha_pon_ani_select_queue,
++	.ndo_start_xmit		= airoha_pon_ani_xmit,
++	.ndo_get_iflink		= airoha_pon_ani_get_iflink,
++	.ndo_set_mac_address	= eth_mac_addr,
++	.ndo_validate_addr	= eth_validate_addr,
++	.ndo_setup_tc		= airoha_pon_ani_setup_tc,
++};
++
++/**
++ * airoha_pon_ani_lower() - the PON interface behind an ANI port device
++ * @netdev: a flow's egress device; replaced by its PON interface when it
++ *	is an ANI port device
++ *
++ * Return: the ANI port device's ifindex, or 0 when @netdev is not one.
++ */
++int airoha_pon_ani_lower(struct net_device **netdev)
++{
++	struct airoha_pon_ani *ani;
++	int ifindex;
++
++	if (!*netdev || (*netdev)->netdev_ops != &airoha_pon_ani_netdev_ops)
++		return 0;
++
++	ani = netdev_priv(*netdev);
++	ifindex = (*netdev)->ifindex;
++	*netdev = netdev_from_priv(ani->pon->dev);
++
++	return ifindex;
++}
++
++static void airoha_pon_ani_setup(struct net_device *netdev)
++{
++	ether_setup(netdev);
++	netdev->netdev_ops = &airoha_pon_ani_netdev_ops;
++	netdev->needs_free_netdev = true;
++	/* the PON table names it by its ifindex */
++	netdev->netns_immutable = true;
++	netdev->pcpu_stat_type = NETDEV_PCPU_STAT_TSTATS;
++}
++
++static unsigned int airoha_pon_ani_num_tx_queues(void)
++{
++	return AIROHA_PON_TCONT_QUEUES;
++}
++
++static unsigned int airoha_pon_ani_num_rx_queues(void)
++{
++	return AIROHA_NUM_RX_RING;
++}
++
++static int airoha_pon_ani_newlink(struct net_device *netdev,
++				  struct rtnl_newlink_params *params,
++				  struct netlink_ext_ack *extack)
++{
++	struct net *link_net = rtnl_newlink_link_net(params);
++	struct airoha_pon_ani *ani = netdev_priv(netdev);
++	struct nlattr **tb = params->tb;
++	struct net_device *lower;
++	struct airoha_pon *pon;
++	int err;
++
++	if (!tb[IFLA_LINK]) {
++		NL_SET_ERR_MSG(extack, "an ANI port device needs a PON link");
++		return -EINVAL;
++	}
++
++	lower = __dev_get_by_index(link_net, nla_get_u32(tb[IFLA_LINK]));
++	if (!lower) {
++		NL_SET_ERR_MSG_ATTR(extack, tb[IFLA_LINK], "unknown link");
++		return -ENODEV;
++	}
++
++	pon = airoha_dev_pon(lower);
++	if (!pon) {
++		NL_SET_ERR_MSG_ATTR(extack, tb[IFLA_LINK],
++				    "the link is not a PON interface");
++		return -EINVAL;
++	}
++
++	if (!net_eq(dev_net(lower), dev_net(netdev))) {
++		NL_SET_ERR_MSG(extack,
++			       "an ANI port device stays in its link's namespace");
++		return -EINVAL;
++	}
++
++	/* one TX queue per T-CONT queue, as on the PON interface */
++	err = netif_set_real_num_tx_queues(netdev, AIROHA_PON_TCONT_QUEUES);
++	if (err) {
++		NL_SET_ERR_MSG(extack, "too few TX queues");
++		return err;
++	}
++
++	ani->pon = pon;
++	ani->netdev = netdev;
++	/* the frame engine DMA-maps its frames */
++	SET_NETDEV_DEV(netdev, lower->dev.parent);
++	netdev->hw_features = lower->vlan_features & ~NETIF_F_HW_TC;
++	netdev->features = netdev->hw_features;
++	netdev->vlan_features = netdev->hw_features;
++	netdev->max_mtu = lower->max_mtu;
++	if (!tb[IFLA_MTU])
++		netdev->mtu = lower->mtu;
++	if (!tb[IFLA_ADDRESS])
++		eth_hw_addr_inherit(netdev, lower);
++	netif_carrier_off(netdev);
++
++	err = register_netdevice(netdev);
++	if (err)
++		return err;
++
++	err = netdev_upper_dev_link(lower, netdev, extack);
++	if (err) {
++		unregister_netdevice(netdev);
++		return err;
++	}
++
++	mutex_lock(&pon->lock);
++	list_add_tail_rcu(&ani->list, &pon->anis);
++	mutex_unlock(&pon->lock);
++
++	airoha_pon_ani_carrier(lower, netdev);
++
++	return 0;
++}
++
++static void airoha_pon_ani_dellink(struct net_device *netdev,
++				   struct list_head *head)
++{
++	struct airoha_pon_ani *ani = netdev_priv(netdev);
++	struct airoha_pon *pon = ani->pon;
++
++	/* unregistering waits out the RCU readers that may still see it */
++	mutex_lock(&pon->lock);
++	list_del_rcu(&ani->list);
++	mutex_unlock(&pon->lock);
++
++	netdev_upper_dev_unlink(netdev_from_priv(pon->dev), netdev);
++	unregister_netdevice_queue(netdev, head);
++
++	/* PPE entries towards it were bound with its rules */
++	airoha_ppe_flush_pon_flows(airoha_pon_eth(pon));
++}
++
++static struct rtnl_link_ops airoha_pon_ani_link_ops __read_mostly = {
++	.kind			= "airoha-pon-ani",
++	.priv_size		= sizeof(struct airoha_pon_ani),
++	.setup			= airoha_pon_ani_setup,
++	.newlink		= airoha_pon_ani_newlink,
++	.dellink		= airoha_pon_ani_dellink,
++	.get_num_tx_queues	= airoha_pon_ani_num_tx_queues,
++	.get_num_rx_queues	= airoha_pon_ani_num_rx_queues,
++};
++
++/* ANI port devices follow their PON interface's carrier, and go with it */
++static int airoha_pon_ani_event(struct notifier_block *nb,
++				unsigned long event, void *ptr)
++{
++	struct net_device *lower = netdev_notifier_info_to_dev(ptr);
++	struct airoha_pon_ani *ani, *tmp;
++	struct airoha_pon *pon;
++	LIST_HEAD(kill);
++
++	pon = airoha_dev_pon(lower);
++	if (!pon)
++		return NOTIFY_DONE;
++
++	/* RTNL is held, and the list changes only under it */
++	switch (event) {
++	case NETDEV_UP:
++	case NETDEV_DOWN:
++	case NETDEV_CHANGE:
++		list_for_each_entry(ani, &pon->anis, list)
++			airoha_pon_ani_carrier(lower, ani->netdev);
++		break;
++	case NETDEV_UNREGISTER:
++		list_for_each_entry_safe(ani, tmp, &pon->anis, list)
++			airoha_pon_ani_dellink(ani->netdev, &kill);
++		unregister_netdevice_many(&kill);
++		break;
++	}
++
++	return NOTIFY_DONE;
++}
++
++static struct notifier_block airoha_pon_ani_nb = {
++	.notifier_call = airoha_pon_ani_event,
++};
++
++int airoha_pon_ani_register(void)
++{
++	int err;
++
++	err = register_netdevice_notifier(&airoha_pon_ani_nb);
++	if (err)
++		return err;
++
++	err = rtnl_link_register(&airoha_pon_ani_link_ops);
++	if (err)
++		unregister_netdevice_notifier(&airoha_pon_ani_nb);
++
++	return err;
++}
++
++void airoha_pon_ani_unregister(void)
++{
++	rtnl_link_unregister(&airoha_pon_ani_link_ops);
++	unregister_netdevice_notifier(&airoha_pon_ani_nb);
++}
++
++MODULE_ALIAS_RTNL_LINK("airoha-pon-ani");
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -821,7 +821,8 @@
+ 		return true;
+ 
+ 	rcu_read_lock();
+-	err = airoha_pon_resolve(e->pon, e->pon_vid, e->pon_pcp, &gem);
++	err = airoha_pon_resolve(e->pon, e->pon_ifindex, e->pon_vid,
++				 e->pon_pcp, &gem);
+ 	rcu_read_unlock();
+ 	if (err)
+ 		return false;
+@@ -1177,7 +1178,7 @@
+ 	struct flow_action_entry *act;
+ 	u8 dsfield = 0, l4proto = 0;
+ 	struct airoha_foe_entry hwe;
+-	int err, i, offload_type;
++	int err, i, offload_type, pon_ifindex;
+ 	u16 addr_type = 0;
+ 
+ 	if (rhashtable_lookup(&eth->flow_table, &f->cookie,
+@@ -1285,6 +1286,9 @@
+ 	    !is_valid_ether_addr(data.eth.h_dest))
+ 		return -EINVAL;
+ 
++	/* a flow towards an ANI port device leaves on its PON interface */
++	pon_ifindex = airoha_pon_ani_lower(&odev);
++
+ 	err = airoha_ppe_foe_entry_prepare(eth, &hwe, odev, offload_type,
+ 					   &data, l4proto, dsfield);
+ 	if (err)
+@@ -1363,6 +1367,7 @@
+ 
+ 	e->pon = airoha_ppe_get_pon(eth, odev);
+ 	if (e->pon) {
++		e->pon_ifindex = pon_ifindex;
+ 		/* the first tag the flow pushes is the one it leaves with */
+ 		e->pon_vid = data.vlan.num ? data.vlan.hdr[0].id
+ 					   : AIROHA_PON_VID_UNTAGGED;
+diff --git a/include/linux/soc/airoha/airoha_pon.h b/include/linux/soc/airoha/airoha_pon.h
+--- a/include/linux/soc/airoha/airoha_pon.h
++++ b/include/linux/soc/airoha/airoha_pon.h
+@@ -39,12 +39,16 @@
+  *	highest (as airoha_pon_tcont_sched() numbers them), that carries the
+  *	upstream frames of this GEM port. Ignored unless @flags has
+  *	AIROHA_PON_GEM_UPSTREAM.
++ * @ifindex: the ANI port device (an airoha-pon-ani link on the PON
++ *	interface) that downstream frames of this GEM port are delivered on,
++ *	or 0 for the PON interface itself
+  */
+ struct airoha_pon_gem {
+ 	u16 port_id;
+ 	u8 tcont;
+ 	u8 flags;
+ 	u8 queue;
++	int ifindex;
+ };
+ 
+ /* upstream frames may use the GEM port */
+@@ -59,8 +63,11 @@
+  * @pcp: the priority code point of the outer tag, 0 to 7, or
+  *	AIROHA_PON_PCP_ANY. A frame without a tag has PCP 0.
+  * @port_id: the GEM port a matching frame is sent on
++ * @ifindex: the device whose frames the rule classifies: an ANI port
++ *	device of the PON interface, or 0 for the PON interface itself
+  *
+- * Rules are tried in table order and the first match wins. A frame that
++ * Rules are tried in table order and the first match wins; a frame is
++ * matched only against the rules of the device it is sent on. A frame that
+  * matches no rule, or whose GEM port is not an upstream GEM port of the
+  * current table, is dropped.
+  */
+@@ -68,6 +75,7 @@
+ 	u16 vid;
+ 	u8 pcp;
+ 	u16 port_id;
++	int ifindex;
+ };
+ 
+ #define AIROHA_PON_VID_UNTAGGED		0x1000
+@@ -109,6 +117,7 @@
+ 			const struct airoha_pon_gem *gems, unsigned int n);
+ int airoha_pon_set_rules(struct airoha_pon *pon,
+ 			 const struct airoha_pon_rule *rules, unsigned int n);
++int airoha_pon_check_ifindex(struct airoha_pon *pon, int ifindex);
+ int airoha_pon_tcont_open(struct airoha_pon *pon, unsigned int tcont,
+ 			  u32 flags);
+ int airoha_pon_tcont_close(struct airoha_pon *pon, unsigned int tcont);
