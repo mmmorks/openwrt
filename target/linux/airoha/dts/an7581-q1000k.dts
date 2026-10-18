@@ -82,6 +82,7 @@
 			function = LED_FUNCTION_WAN;
 			function-enumerator = <1>;
 			gpios = <&en7581_pinctrl 22 GPIO_ACTIVE_HIGH>;
+			linux,default-trigger = "pon-link";
 		};
 
 		led-6 {
@@ -102,6 +103,26 @@
 			function = LED_FUNCTION_LAN;
 			gpios = <&en7581_pinctrl 43 GPIO_ACTIVE_LOW>;
 		};
+	};
+
+	pon_gpon_supply: regulator-pon-gpon {
+		compatible = "regulator-fixed";
+		regulator-name = "pon-gpon";
+		gpio = <&en7581_pinctrl 9 GPIO_ACTIVE_LOW>;
+	};
+
+	pon_xgspon_supply: regulator-pon-xgspon {
+		compatible = "regulator-fixed";
+		regulator-name = "pon-xgspon";
+		gpio = <&en7581_pinctrl 8 GPIO_ACTIVE_LOW>;
+	};
+
+	/* routes the fibre: state 0 to the GPON optic, state 3 to XGS-PON */
+	pon_path_mux: mux-controller-pon {
+		compatible = "gpio-mux";
+		mux-gpios = <&en7581_pinctrl 45 GPIO_ACTIVE_HIGH>,
+			    <&en7581_pinctrl 46 GPIO_ACTIVE_HIGH>;
+		#mux-state-cells = <1>;
 	};
 };
 
@@ -145,6 +166,21 @@
 			label = "vendor";
 			reg = <0x00000000 0x00600000>;
 			read-only;
+
+			/* per-unit laser calibration, in the factory data at 0x400000 */
+			en7572_cal_layout: nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				en7572_cal_gpon: calibration@411000 {
+					reg = <0x411000 0x200>;
+				};
+
+				en7572_cal_xgspon: calibration@412000 {
+					reg = <0x412000 0x200>;
+				};
+			};
 		};
 
 		partition@600000 {
@@ -205,13 +241,18 @@
 	status = "okay";
 };
 
-/* Optical uplink; enable once the PON data path is supported. */
+/* The PON uplink: the PON PHY drives the serdes, and port 2 is the PON interface. */
 &pon_pcs {
 	status = "disabled";
 };
 
 &gdm2 {
-	status = "disabled";
+	/delete-property/ pcs-handle;
+	airoha,pon;
+	status = "okay";
+
+	/* the name airoha-omci's helpers and airoha-pon-ani links give the PON interface */
+	openwrt,netdev-name = "pon";
 };
 
 &eth_pcs {
@@ -263,4 +304,38 @@
 	status = "okay";
 	pinctrl-names = "default";
 	pinctrl-0 = <&uart2_pins>;
+};
+
+&en7581_pon_phy {
+	tx-disable-gpios = <&en7581_pinctrl 38 GPIO_ACTIVE_HIGH>;
+	airoha,invert-rx-detect;
+	status = "okay";
+};
+
+/*
+ * One optic per line mode behind one fibre: the MAC powers the one it runs
+ * and picks by which sees light. Both share the EN7572 on i2c0.
+ */
+&en7581_pon_mac {
+	phys = <&en7581_pon_phy>, <&en7572>;
+	gpon-supply = <&pon_gpon_supply>;
+	xgspon-supply = <&pon_xgspon_supply>;
+	mux-states = <&pon_path_mux 0>, <&pon_path_mux 3>;
+	mux-state-names = "gpon", "xgspon";
+	los-gpios = <&en7581_pinctrl 10 GPIO_ACTIVE_HIGH>,
+		    <&en7581_pinctrl 11 GPIO_ACTIVE_HIGH>;
+	status = "okay";
+};
+
+&i2c0 {
+	status = "okay";
+
+	en7572: laser-driver@50 {
+		compatible = "airoha,en7572";
+		reg = <0x50>, <0x51>;
+		reg-names = "main", "diag";
+		nvmem-cells = <&en7572_cal_gpon>, <&en7572_cal_xgspon>;
+		nvmem-cell-names = "calibration-gpon", "calibration-xgspon";
+		#phy-cells = <0>;
+	};
 };
