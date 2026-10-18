@@ -1,0 +1,149 @@
+From: John Morkel <john@morkel.me>
+Date: Fri, 9 Oct 2026 10:01:00 -0700
+Subject: [PATCH] net: airoha: budget the packet buffers of the PON T-CONTs
+
+On EN7581 the WAN QDMA can cap the packet buffers one channel, and all
+channels together, may hold. A PON ONU sizes the caps by the number of
+T-CONTs it carries: per channel 0x40, and in all 0x5e per T-CONT, for up
+to eight T-CONTs; per channel 0x10, and in all 0x2e per T-CONT less
+0x2c, beyond. A GPON ONU sets fixed caps of 4 and 0xe0 when it gets its
+ONU-ID and while the OLT provisions it over OMCI.
+
+airoha_pon_buf_budget() turns the estimate on and sets the fixed caps or
+the share of the open T-CONTs; when to call it is the PON MAC driver's
+to know. airoha_pon_put() turns the estimate off again, the way
+airoha_qdma_init_qos() leaves it.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_pon.c b/drivers/net/ethernet/airoha/airoha_pon.c
+index a4b9d07..a5048dd 100644
+--- a/drivers/net/ethernet/airoha/airoha_pon.c
++++ b/drivers/net/ethernet/airoha/airoha_pon.c
+@@ -28,6 +28,18 @@
+ #define AIROHA_PON_RETIRE_TRIES		10
+ /* reads of the RX channels once every channel retired */
+ #define AIROHA_PON_RX_IDLE_READS	10
++/* EN7581 packet buffer thresholds: the fixed setting, then the shares of
++ * up to AIROHA_PON_BUF_FEW_TCONTS and of more T-CONTs
++ */
++#define AIROHA_PON_BUF_FIXED_CHAN	0x4
++#define AIROHA_PON_BUF_FIXED_TOTAL	0xe0
++#define AIROHA_PON_BUF_FEW_TCONTS	8
++#define AIROHA_PON_BUF_FEW_CHAN		0x40
++#define AIROHA_PON_BUF_FEW_PER_TCONT	0x5e
++#define AIROHA_PON_BUF_MANY_CHAN	0x10
++#define AIROHA_PON_BUF_MANY_PER_TCONT	0x2e
++#define AIROHA_PON_BUF_MANY_LESS	0x2c
++
+ /* control frames leave on T-CONT channel 0, in its highest queue */
+ #define AIROHA_PON_CTRL_QUEUE		7
+ /* no meter, and neither account group counts the frame */
+@@ -228,7 +240,8 @@ EXPORT_SYMBOL_GPL(airoha_pon_get);
+  * airoha_pon_put() - release the PON interface airoha_pon_get() took
+  * @pon: the interface
+  *
+- * Unregisters the consumer's callbacks if it has not done so itself.
++ * Unregisters the consumer's callbacks if it has not done so itself, and
++ * turns off the packet buffer budget airoha_pon_buf_budget() set.
+  */
+ void airoha_pon_put(struct airoha_pon *pon)
+ {
+@@ -238,6 +251,9 @@ void airoha_pon_put(struct airoha_pon *pon)
+ 
+ 	mutex_lock(&pon->lock);
+ 	pon->consumer = NULL;
++	/* back to airoha_qdma_init_qos()'s setting; the thresholds stay */
++	airoha_qdma_clear(pon->qdma, REG_PSE_BUF_USAGE_CFG,
++			  PSE_BUF_ESTIMATE_EN_MASK);
+ 	mutex_unlock(&pon->lock);
+ 
+ 	module_put(THIS_MODULE);
+@@ -720,6 +736,57 @@ int airoha_pon_retire_all(struct airoha_pon *pon)
+ }
+ EXPORT_SYMBOL_GPL(airoha_pon_retire_all);
+ 
++/**
++ * airoha_pon_buf_budget() - share the packet buffers among the T-CONTs
++ * @pon: the interface
++ * @fixed: true for the fixed setting; false for a share that follows the
++ *	number of open T-CONTs, never counted below one
++ *
++ * A GPON ONU takes the fixed setting when it gets its ONU-ID, on each OMCI
++ * MIB upload message and at a T-CONT opened once OMCI provisioning went
++ * quiet, and the share when it goes quiet and 1 s after such a T-CONT. An
++ * XGS-PON ONU takes the share when an Alloc-ID opens a T-CONT.
++ *
++ * Return: 0, or -EOPNOTSUPP on a SoC whose thresholds are not known.
++ */
++int airoha_pon_buf_budget(struct airoha_pon *pon, bool fixed)
++{
++	u32 chan, total;
++	unsigned int n;
++
++	if (!airoha_is_7581(airoha_pon_eth(pon)))
++		return -EOPNOTSUPP;
++
++	mutex_lock(&pon->lock);
++
++	n = max(bitmap_weight(pon->tconts, AIROHA_PON_NUM_TCONTS), 1);
++	if (fixed) {
++		chan = AIROHA_PON_BUF_FIXED_CHAN;
++		total = AIROHA_PON_BUF_FIXED_TOTAL;
++	} else if (n <= AIROHA_PON_BUF_FEW_TCONTS) {
++		chan = AIROHA_PON_BUF_FEW_CHAN;
++		total = AIROHA_PON_BUF_FEW_PER_TCONT * n;
++	} else {
++		chan = AIROHA_PON_BUF_MANY_CHAN;
++		total = AIROHA_PON_BUF_MANY_PER_TCONT * n -
++			AIROHA_PON_BUF_MANY_LESS;
++	}
++
++	airoha_qdma_set(pon->qdma, REG_PSE_BUF_USAGE_CFG,
++			PSE_BUF_ESTIMATE_EN_MASK);
++	airoha_qdma_rmw(pon->qdma, REG_PSE_BUF_THRESH_CFG,
++			PSE_BUF_CHAN_THRESH_MASK,
++			FIELD_PREP(PSE_BUF_CHAN_THRESH_MASK, chan));
++	airoha_qdma_rmw(pon->qdma, REG_PSE_BUF_THRESH_CFG,
++			PSE_BUF_TOTAL_THRESH_MASK,
++			FIELD_PREP(PSE_BUF_TOTAL_THRESH_MASK, total));
++
++	mutex_unlock(&pon->lock);
++
++	return 0;
++}
++EXPORT_SYMBOL_GPL(airoha_pon_buf_budget);
++
+ /**
+  * airoha_pon_tcont_sched() - set how a T-CONT's queues share it
+  * @pon: the interface
+diff --git a/drivers/net/ethernet/airoha/airoha_regs.h b/drivers/net/ethernet/airoha/airoha_regs.h
+index 433d15f..c44601a 100644
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -878,6 +878,13 @@
+ #define TXQ_CNGST_DROP_EN		BIT(31)
+ #define TXQ_CNGST_DEI_DROP_EN		BIT(30)
+ 
++/* with PSE_BUF_ESTIMATE_EN_MASK set: the buffers one channel, and all
++ * channels together, may hold
++ */
++#define REG_PSE_BUF_THRESH_CFG		0x10d0
++#define PSE_BUF_CHAN_THRESH_MASK	GENMASK(26, 16)
++#define PSE_BUF_TOTAL_THRESH_MASK	GENMASK(10, 0)
++
+ #define REG_SLA_TRTCM_CFG		0x1150
+ #define SLA_TRTCM_EN_MASK		BIT(31)
+ #define SLA_TRTCM_MODE_MASK		BIT(30)
+diff --git a/include/linux/soc/airoha/airoha_pon.h b/include/linux/soc/airoha/airoha_pon.h
+index 0e7dfa1..4d36280 100644
+--- a/include/linux/soc/airoha/airoha_pon.h
++++ b/include/linux/soc/airoha/airoha_pon.h
+@@ -113,6 +113,7 @@ int airoha_pon_tcont_open(struct airoha_pon *pon, unsigned int tcont,
+ 			  u32 flags);
+ int airoha_pon_tcont_close(struct airoha_pon *pon, unsigned int tcont);
+ int airoha_pon_retire_all(struct airoha_pon *pon);
++int airoha_pon_buf_budget(struct airoha_pon *pon, bool fixed);
+ int airoha_pon_tcont_sched(struct airoha_pon *pon, unsigned int tcont,
+ 			   unsigned int nstrict, const u16 *weights);
+ int airoha_pon_tcont_rate(struct airoha_pon *pon, unsigned int tcont,
