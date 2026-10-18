@@ -1,0 +1,37 @@
+From: John Morkel <john@morkel.me>
+Date: Thu, 8 Oct 2026 23:00:00 -0700
+Subject: [PATCH] net: airoha: reduce the channel inside CHAN_QOS_MODE_MASK()
+
+Each REG_CHAN_QOS_MODE register holds the 3-bit scheduling mode of eight
+QDMA channels, 4 bits apart. airoha_qdma_set_chan_tx_sched() selects the
+register with channel >> 3 but builds the field mask from the unreduced
+channel, so for channel >= 8 CHAN_QOS_MODE_MASK() lies at bit 32 or above,
+is truncated away by the u32 airoha_qdma_rmw(), and the mode write is
+silently dropped.
+
+The tc paths cannot reach it, since they reduce the channel modulo
+AIROHA_NUM_QOS_CHANNELS (4) first, but the PON mode later in this series
+schedules all 32 channels of the WAN QDMA, one per T-CONT. Reduce the
+channel inside the macro, as DFT_CPORT_MASK() does for its
+eight-per-register field, so the mask always addresses the register
+REG_CHAN_QOS_MODE(channel >> 3) selects. No functional change for
+channels 0-7.
+
+The mask has been wrong since CHAN_QOS_MODE_MASK() was introduced in
+commit 20bf7d07c956 ("net: airoha: Add sched ETS offload support").
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_regs.h b/drivers/net/ethernet/airoha/airoha_regs.h
+index 94d53d4..4c9f789 100644
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -852,7 +852,7 @@
+ #define PSE_BUF_ESTIMATE_EN_MASK	BIT(29)
+ 
+ #define REG_CHAN_QOS_MODE(_n)		(0x1040 + ((_n) << 2))
+-#define CHAN_QOS_MODE_MASK(_n)		GENMASK(2 + ((_n) << 2), (_n) << 2)
++#define CHAN_QOS_MODE_MASK(_n)		GENMASK(2 + (((_n) % 8) << 2), ((_n) % 8) << 2)
+ 
+ #define REG_GLB_TRTCM_CFG		0x1080
+ #define GLB_TRTCM_EN_MASK		BIT(31)
