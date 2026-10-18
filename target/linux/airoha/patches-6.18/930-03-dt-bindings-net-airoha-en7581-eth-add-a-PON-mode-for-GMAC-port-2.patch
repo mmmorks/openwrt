@@ -1,0 +1,57 @@
+From: John Morkel <john@morkel.me>
+Date: Thu, 8 Oct 2026 23:02:00 -0700
+Subject: [PATCH] dt-bindings: net: airoha,en7581-eth: add a PON mode for GMAC port 2
+
+On the EN7581 the second GMAC port can carry the SoC's PON MAC (GPON
+or XGS-PON) instead of an Ethernet MAC. The port then has no PHY and no
+PCS: a PON MAC driver owns the link, and it decides which GEM port and
+T-CONT each frame uses. Add the boolean airoha,pon to a GMAC port node to
+select that mode, and allow it on port 2 only.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/Documentation/devicetree/bindings/net/airoha,en7581-eth.yaml b/Documentation/devicetree/bindings/net/airoha,en7581-eth.yaml
+index 6d22131..ba01feb 100644
+--- a/Documentation/devicetree/bindings/net/airoha,en7581-eth.yaml
++++ b/Documentation/devicetree/bindings/net/airoha,en7581-eth.yaml
+@@ -97,10 +97,28 @@ patternProperties:
+         maximum: 4
+         description: GMAC port identifier
+ 
++      airoha,pon:
++        type: boolean
++        description:
++          The port is the SoC's PON interface (GPON or XGS-PON) rather than
++          an Ethernet MAC. It has no PHY and no PCS, so the port takes no
++          phy-mode, phy-handle, pcs-handle or fixed-link. A PON MAC driver
++          owns its link state and maps its traffic to GEM ports and T-CONTs
++          through the frame engine driver. Only GMAC port 2 can be the PON
++          interface.
++
+     required:
+       - reg
+       - compatible
+ 
++    if:
++      required:
++        - airoha,pon
++    then:
++      properties:
++        reg:
++          const: 2
++
+ required:
+   - compatible
+   - reg
+@@ -162,5 +180,11 @@ examples:
+           compatible = "airoha,eth-mac";
+           reg = <1>;
+         };
++
++        pon: ethernet@2 {
++          compatible = "airoha,eth-mac";
++          reg = <2>;
++          airoha,pon;
++        };
+       };
+     };
