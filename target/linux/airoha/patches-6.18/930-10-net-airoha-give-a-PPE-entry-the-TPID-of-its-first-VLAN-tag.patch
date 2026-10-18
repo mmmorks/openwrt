@@ -1,0 +1,80 @@
+From: John Morkel <john@morkel.me>
+Date: Fri, 9 Oct 2026 11:30:00 -0700
+Subject: [PATCH] net: airoha: give a PPE entry the TPID of its first VLAN tag
+
+The VPM field of a bound FOE entry (IB1 bits 21:20) selects the TPID of
+the first VLAN tag the entry carries: 1 for 0x8100, 2 for 0x88a8, 3 for
+the PPE's custom TPID. The vendor SDK fills it from the TPID of the
+frame's first tag. airoha_ppe writes the number of tags there instead,
+so a flow pushing two 802.1Q tags is bound with 0x88a8 as the TPID of
+its first one. And it refuses every push that is not 802.1Q, so a flow
+that pushes an 802.1ad tag stays on the CPU. On a PON uplink the OLT
+picks that TPID, per service, through the OMCI extended VLAN tagging
+operation (G.988 ME 171), and 0x88a8 is a value it may pick.
+
+Set VPM from the TPID of the first tag, and accept 802.1ad there. The
+entry has no TPID for its second tag, so a second push still has to be
+802.1Q.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index f1b8665..4000d5c 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -301,6 +301,13 @@ enum {
+ 	AIROHA_FOE_STATE_FIN
+ };
+ 
++/* TPID of the first VLAN tag of a bound entry (AIROHA_FOE_IB1_BIND_VPM) */
++enum {
++	AIROHA_FOE_VPM_NONE,
++	AIROHA_FOE_VPM_8021Q,
++	AIROHA_FOE_VPM_8021AD,
++};
++
+ enum {
+ 	PPE_PKT_TYPE_IPV4_HNAPT = 0,
+ 	PPE_PKT_TYPE_IPV4_ROUTE = 1,
+diff --git a/drivers/net/ethernet/airoha/airoha_ppe.c b/drivers/net/ethernet/airoha/airoha_ppe.c
+index 84a7c24..99e9183 100644
+--- a/drivers/net/ethernet/airoha/airoha_ppe.c
++++ b/drivers/net/ethernet/airoha/airoha_ppe.c
+@@ -347,15 +347,19 @@ static int airoha_ppe_foe_entry_prepare(struct airoha_eth *eth,
+ 	u32 qdata = FIELD_PREP(AIROHA_FOE_SHAPER_ID, 0x7f), ports_pad, val;
+ 	int wlan_etype = -EINVAL, dsa_port = airoha_get_dsa_port(&netdev);
+ 	struct airoha_foe_mac_info_common *l2;
+-	u8 smac_id = 0xf;
++	u8 smac_id = 0xf, vpm = AIROHA_FOE_VPM_NONE;
+ 
+ 	memset(hwe, 0, sizeof(*hwe));
+ 
++	if (data->vlan.num)
++		vpm = data->vlan.hdr[0].proto == htons(ETH_P_8021AD) ?
++		      AIROHA_FOE_VPM_8021AD : AIROHA_FOE_VPM_8021Q;
++
+ 	val = FIELD_PREP(AIROHA_FOE_IB1_BIND_STATE, AIROHA_FOE_STATE_BIND) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PACKET_TYPE, type) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_UDP, l4proto == IPPROTO_UDP) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VLAN_LAYER, data->vlan.num) |
+-	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, data->vlan.num) |
++	      FIELD_PREP(AIROHA_FOE_IB1_BIND_VPM, vpm) |
+ 	      FIELD_PREP(AIROHA_FOE_IB1_BIND_PPPOE, data->pppoe.num) |
+ 	      AIROHA_FOE_IB1_BIND_TTL;
+ 	hwe->ib1 = val;
+@@ -1245,8 +1249,13 @@ static int airoha_ppe_flow_offload_replace(struct airoha_eth *eth,
+ 		case FLOW_ACTION_CSUM:
+ 			break;
+ 		case FLOW_ACTION_VLAN_PUSH:
+-			if (data.vlan.num == 2 ||
+-			    act->vlan.proto != htons(ETH_P_8021Q))
++			if (data.vlan.num == 2)
++				return -EOPNOTSUPP;
++
++			/* The entry carries a TPID for its first tag only */
++			if (act->vlan.proto != htons(ETH_P_8021Q) &&
++			    (act->vlan.proto != htons(ETH_P_8021AD) ||
++			     data.vlan.num))
+ 				return -EOPNOTSUPP;
+ 
+ 			data.vlan.hdr[data.vlan.num].id = act->vlan.vid;
