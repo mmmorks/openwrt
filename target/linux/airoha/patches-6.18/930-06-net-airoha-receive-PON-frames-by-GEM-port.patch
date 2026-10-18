@@ -1,0 +1,160 @@
+From: John Morkel <john@morkel.me>
+Date: Thu, 8 Oct 2026 23:05:00 -0700
+Subject: [PATCH] net: airoha: receive PON frames by GEM port
+
+A frame received on a PON port carries its 16-bit GEM port ID in RX
+message word 0, bits 29-14, of which QDMA_ETH_RXMSG_SPTAG covers only the
+low eight; bit 8 marks a control (OMCI) frame and, on XGS-PON, bit 30 a
+frame whose integrity check the hardware left to software.
+
+Hand control frames to the PON MAC driver's rx_ctrl() callback, without
+eth_type_trans(), and drop them while no driver is registered. Deliver a
+data frame only when its GEM port is in the table and carries downstream
+traffic, and report its checksum verified only when it is IP with a valid
+L4 header and neither checksum-failed bit is set.
+
+To leave control frames unparsed, eth_type_trans() moves from the
+first buffer of a frame, where it ran after the LRO fixup, to the point
+where the whole frame has arrived; it still runs before the PPE looks at
+the frame.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index f659237..3789874 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -939,8 +939,6 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget)
+ 				q->skb = NULL;
+ 				continue;
+ 			}
+-
+-			q->skb->protocol = eth_type_trans(q->skb, netdev);
+ 		} else { /* scattered frame */
+ 			struct skb_shared_info *shinfo = skb_shinfo(q->skb);
+ 			int nr_frags = shinfo->nr_frags;
+@@ -973,6 +971,26 @@ static int airoha_qdma_rx_process(struct airoha_queue *q, int budget)
+ 						  &port->dsa_meta[sptag]->dst);
+ 		}
+ 
++		if (dev->pon) {
++			u32 msg0 = le32_to_cpu(READ_ONCE(desc->msg0));
++			int err;
++
++			/* control frames go to the PON MAC driver, and
++			 * frames of unknown GEM ports nowhere
++			 */
++			err = airoha_pon_rx(dev->pon, q->skb, msg0, msg1);
++			if (err) {
++				if (err < 0) {
++					dev_kfree_skb(q->skb);
++					dev_core_stats_rx_dropped_inc(netdev);
++				}
++				q->skb = NULL;
++				done++;
++				continue;
++			}
++		}
++
++		q->skb->protocol = eth_type_trans(q->skb, netdev);
+ 		hash = FIELD_GET(AIROHA_RXD4_FOE_ENTRY, msg1);
+ 		if (hash != AIROHA_RXD4_FOE_ENTRY)
+ 			skb_set_hash(q->skb, jhash_1word(hash, 0),
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index d5426a1..0691fb5 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -811,6 +811,8 @@ u16 airoha_pon_select_queue(struct airoha_pon *pon, struct sk_buff *skb);
+ int airoha_pon_tx_msg(struct airoha_pon *pon, struct sk_buff *skb, u32 *msg0,
+ 		      u32 *msg1);
+ void airoha_pon_ctrl_tx_wake(struct airoha_pon *pon);
++int airoha_pon_rx(struct airoha_pon *pon, struct sk_buff *skb, u32 msg0,
++		  u32 msg1);
+ 
+ void airoha_ppe_set_xmit_frame_size(struct airoha_gdm_dev *dev);
+ void airoha_ppe_set_cpu_port(struct airoha_gdm_dev *dev, u8 ppe_id, u8 fport);
+diff --git a/drivers/net/ethernet/airoha/airoha_pon.c b/drivers/net/ethernet/airoha/airoha_pon.c
+index 1095cbd..63adb60 100644
+--- a/drivers/net/ethernet/airoha/airoha_pon.c
++++ b/drivers/net/ethernet/airoha/airoha_pon.c
+@@ -736,6 +736,65 @@ int airoha_pon_tx_msg(struct airoha_pon *pon, struct sk_buff *skb, u32 *msg0,
+ 	return 0;
+ }
+ 
++/* GPON reports the checksums verified only for a valid L4 header on IP */
++static bool airoha_pon_rx_csum_ok(u32 msg1)
++{
++	if (!(msg1 & (QDMA_ETH_RXMSG_IP4_MASK | QDMA_ETH_RXMSG_IP6_MASK)))
++		return false;
++
++	if (!(msg1 & QDMA_ETH_RXMSG_L4_VALID_MASK))
++		return false;
++
++	return !(msg1 & (QDMA_ETH_RXMSG_IP4F_MASK | QDMA_ETH_RXMSG_L4F_MASK));
++}
++
++/* Sort a frame received on the PON port. Return: 0 to deliver it to the
++ * stack, 1 when the PON MAC driver took it, a negative error to drop it.
++ */
++int airoha_pon_rx(struct airoha_pon *pon, struct sk_buff *skb, u32 msg0,
++		  u32 msg1)
++{
++	u16 port_id = FIELD_GET(QDMA_ETH_RXMSG_SP_TAG_MASK, msg0);
++	const struct airoha_pon_gem *gem = NULL;
++	const struct airoha_pon_map *map;
++	int ret = -ENOENT;
++
++	rcu_read_lock();
++
++	if (msg0 & QDMA_ETH_RXMSG_OAM_MASK) {
++		struct airoha_pon_client *client;
++		u32 flags = 0;
++
++		client = rcu_dereference(pon->client);
++		if (!client || !client->ops->rx_ctrl)
++			goto unlock;
++
++		if (msg0 & QDMA_ETH_RXMSG_MIC_SW_MASK)
++			flags |= AIROHA_PON_RX_MIC_UNCHECKED;
++
++		/* the frame engine has not parsed it as Ethernet */
++		skb->ip_summed = CHECKSUM_NONE;
++		client->ops->rx_ctrl(client->priv, skb, port_id, flags);
++		ret = 1;
++		goto unlock;
++	}
++
++	map = rcu_dereference(pon->map);
++	if (map)
++		gem = airoha_pon_find_gem(map, port_id);
++	if (!gem || !(gem->flags & AIROHA_PON_GEM_DOWNSTREAM))
++		goto unlock;
++
++	if (skb->ip_summed == CHECKSUM_UNNECESSARY &&
++	    !airoha_pon_rx_csum_ok(msg1))
++		skb->ip_summed = CHECKSUM_NONE;
++	ret = 0;
++unlock:
++	rcu_read_unlock();
++
++	return ret;
++}
++
+ void airoha_pon_ctrl_tx_wake(struct airoha_pon *pon)
+ {
+ 	struct airoha_pon_client *client;
+diff --git a/drivers/net/ethernet/airoha/airoha_regs.h b/drivers/net/ethernet/airoha/airoha_regs.h
+index a914c0d..42a46d9 100644
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -905,7 +905,10 @@
+ #define QDMA_ETH_TXMSG_ACNT_G0_MASK	GENMASK(5, 0)	/* 0x3f do not count */
+ 
+ /* RX MSG0 */
++#define QDMA_ETH_RXMSG_MIC_SW_MASK	BIT(30)
++#define QDMA_ETH_RXMSG_SP_TAG_MASK	GENMASK(29, 14)
+ #define QDMA_ETH_RXMSG_SPTAG		GENMASK(21, 14)
++#define QDMA_ETH_RXMSG_OAM_MASK		BIT(8)
+ /* RX MSG1 */
+ #define QDMA_ETH_RXMSG_DEI_MASK		BIT(31)
+ #define QDMA_ETH_RXMSG_IP6_MASK		BIT(30)
