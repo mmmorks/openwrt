@@ -1,0 +1,110 @@
+From 1c71b9173d7ab68328d61a813df59cbb9ee004be Mon Sep 17 00:00:00 2001
+From: John Morkel <john@morkel.me>
+Date: Sun, 18 Oct 2026 21:00:00 +0000
+Subject: [PATCH] dt-bindings: phy: add Airoha EN7581 PON PHY
+
+Describe the PON serdes, line block and transmit-disable connection.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+ .../bindings/phy/airoha,en7581-pon-phy.yaml   | 91 +++++++++++++++++++
+ 1 file changed, 91 insertions(+)
+ create mode 100644 Documentation/devicetree/bindings/phy/airoha,en7581-pon-phy.yaml
+
+diff --git a/Documentation/devicetree/bindings/phy/airoha,en7581-pon-phy.yaml b/Documentation/devicetree/bindings/phy/airoha,en7581-pon-phy.yaml
+new file mode 100644
+index 0000000..97239f3
+--- /dev/null
++++ b/Documentation/devicetree/bindings/phy/airoha,en7581-pon-phy.yaml
+@@ -0,0 +1,91 @@
++# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
++%YAML 1.2
++---
++$id: http://devicetree.org/schemas/phy/airoha,en7581-pon-phy.yaml#
++$schema: http://devicetree.org/meta-schemas/core.yaml#
++
++title: Airoha EN7581 PON PHY
++
++maintainers:
++  - mmmorks <john@morkel.me>
++
++description:
++  The PON PHY of the EN7581 is the serdes that faces the optical module, plus
++  a line block that finds downstream frame sync, latches link events, counts
++  line errors and shapes the upstream bursts. It runs GPON (ITU-T G.984) or
++  XGS-PON (ITU-T G.9807.1); the PON MAC picks the mode. The PHY also writes a
++  few fields of the system controller and of the chip-level controller.
++
++properties:
++  compatible:
++    const: airoha,en7581-pon-phy
++
++  reg:
++    items:
++      - description: serdes, analog half followed by the PMA half
++      - description: line block
++
++  reg-names:
++    items:
++      - const: serdes
++      - const: line
++
++  resets:
++    maxItems: 1
++    description: the PON PHY reset line of the system controller
++
++  airoha,system-controller:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      The system controller node. The PHY selects the PON line mode there and
++      releases the optical module's transmit-power pin and the PHY's bus.
++
++  airoha,chip-controller:
++    $ref: /schemas/types.yaml#/definitions/phandle
++    description:
++      The chip-level controller node. The PHY's transmitter test modes take the
++      burst-enable pin from the PON block there.
++
++  tx-disable-gpios:
++    maxItems: 1
++    description:
++      The optical module's transmit-disable input. The PHY turns the
++      module's transmitter off and on with it, around its own resets and
++      when the PON MAC asks; nothing else drives it. It must be a GPIO that
++      can be set without sleeping.
++
++  "#phy-cells":
++    const: 0
++
++required:
++  - compatible
++  - reg
++  - reg-names
++  - resets
++  - airoha,system-controller
++  - airoha,chip-controller
++  - "#phy-cells"
++
++additionalProperties: false
++
++examples:
++  - |
++    #include <dt-bindings/gpio/gpio.h>
++    #include <dt-bindings/reset/airoha,en7581-reset.h>
++
++    soc {
++        #address-cells = <2>;
++        #size-cells = <2>;
++
++        phy@1fa8a000 {
++            compatible = "airoha,en7581-pon-phy";
++            reg = <0x0 0x1fa8a000 0x0 0x2000>,
++                  <0x0 0x1faf0000 0x0 0x1000>;
++            reg-names = "serdes", "line";
++            airoha,system-controller = <&scuclk>;
++            airoha,chip-controller = <&chipctl>;
++            resets = <&scuclk EN7581_XPON_PHY_RST>;
++            tx-disable-gpios = <&en7581_pinctrl 38 GPIO_ACTIVE_HIGH>;
++            #phy-cells = <0>;
++        };
++    };
