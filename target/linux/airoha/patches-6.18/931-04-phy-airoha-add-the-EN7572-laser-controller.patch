@@ -1,0 +1,1014 @@
+From 6ca8d679a33b0e6400231a3bf1b59fce39182e29 Mon Sep 17 00:00:00 2001
+From: John Morkel <john@morkel.me>
+Date: Sun, 18 Oct 2026 21:00:00 +0000
+Subject: [PATCH] phy: airoha: add the EN7572 laser controller
+
+Load the program and data images with request_firmware and read calibration
+from NVMEM. Firmware files and device calibration are not distributed
+with this driver. Include its Kconfig and Makefile entries.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+ .../ABI/testing/sysfs-bus-i2c-devices-en7572  |  15 +
+ drivers/phy/airoha/Kconfig                    |  16 +
+ drivers/phy/airoha/Makefile                   |   2 +
+ drivers/phy/airoha/phy-en7572.c               | 900 ++++++++++++++++++
+ include/linux/phy/en7572.h                    |  26 +
+ 5 files changed, 959 insertions(+)
+ create mode 100644 Documentation/ABI/testing/sysfs-bus-i2c-devices-en7572
+ create mode 100644 drivers/phy/airoha/phy-en7572.c
+ create mode 100644 include/linux/phy/en7572.h
+
+diff --git a/Documentation/ABI/testing/sysfs-bus-i2c-devices-en7572 b/Documentation/ABI/testing/sysfs-bus-i2c-devices-en7572
+new file mode 100644
+index 0000000..f775b7a
+--- /dev/null
++++ b/Documentation/ABI/testing/sysfs-bus-i2c-devices-en7572
+@@ -0,0 +1,15 @@
++What:		/sys/bus/i2c/devices/<bus>-<addr>/diagnostics
++Date:		October 2026
++KernelVersion:	6.18
++Contact:	mmmorks <john@morkel.me>
++Description:
++		(RO) The EN7572 laser driver's diagnostics page: the first 256
++		bytes of its diagnostics slave, the I2C address after <addr>,
++		the control slave the driver binds. The chip's microcontroller
++		keeps the page in the layout of the SFP diagnostics
++		(include/linux/sfp.h); bytes 96 to 105 are the temperature
++		(signed, 1/256 C), the supply voltage (100 uV), the laser bias
++		(2 uA) and the transmit and receive power (0.1 uW), each a
++		big-endian 16-bit value. Each read reads the chip. Reads fail
++		with ENODATA until the chip's PHY has been powered on, which
++		loads and starts the microcontroller.
+diff --git a/drivers/phy/airoha/Kconfig b/drivers/phy/airoha/Kconfig
+index f5ec452..30668f8 100644
+--- a/drivers/phy/airoha/Kconfig
++++ b/drivers/phy/airoha/Kconfig
+@@ -55,3 +55,19 @@ config PHY_EN7581_PON
+ 
+ 	  To compile this driver as a module, choose M here: the module
+ 	  will be called phy-en7581-pon.
++
++config PHY_EN7572
++	tristate "Airoha EN7572 PON laser driver"
++	depends on I2C
++	depends on OF
++	select GENERIC_PHY
++	select FW_LOADER
++	help
++	  Say Y here to add support for the Airoha EN7572, the laser driver
++	  and limiting amplifier of a PON optic, on I2C. The driver loads the
++	  chip's microcontroller with its firmware and the calibration table
++	  of the PON mode in use, starts it, and limits the laser's drive
++	  currents when it runs hot. A PON MAC driver uses it as a PHY.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called phy-en7572.
+diff --git a/drivers/phy/airoha/Makefile b/drivers/phy/airoha/Makefile
+index 45973d4..8e001b4 100644
+--- a/drivers/phy/airoha/Makefile
++++ b/drivers/phy/airoha/Makefile
+@@ -7,3 +7,5 @@ obj-$(CONFIG_PHY_AIROHA_AN7583_USB)	+= phy-airoha-an7583-usb.o
+ 
+ obj-$(CONFIG_PHY_EN7581_PON)		+= phy-en7581-pon.o
+ phy-en7581-pon-y			:= phy-en7581-pon-core.o phy-en7581-pon-seq.o
++
++obj-$(CONFIG_PHY_EN7572)		+= phy-en7572.o
+diff --git a/drivers/phy/airoha/phy-en7572.c b/drivers/phy/airoha/phy-en7572.c
+new file mode 100644
+index 0000000..541e5f1
+--- /dev/null
++++ b/drivers/phy/airoha/phy-en7572.c
+@@ -0,0 +1,900 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Airoha EN7572 PON laser driver
++ *
++ * The EN7572 drives the laser of a PON optic and amplifies its receiver. It
++ * answers on I2C at two addresses: a control slave, through which the host
++ * fills the memories of the chip's microcontroller and runs it, and at the
++ * next address a diagnostics slave. Below 0x100 the diagnostics slave is a
++ * page the microcontroller keeps in the layout of the SFP diagnostics
++ * (include/linux/sfp.h); above it are the chip's own registers. Both take a
++ * 16-bit register pointer, then the bytes; a 4-byte access is a
++ * little-endian word.
++ *
++ * The microcontroller runs the laser's loops (bias and modulation current,
++ * the transmit eye) from a calibration table, one per PON mode. The host
++ * loads two firmware images and the table, starts it, and runs one slow
++ * over-temperature limiter beside it. That is all this driver does.
++ *
++ * It is a generic PHY provider: phy_set_mode_ext() picks the PON mode,
++ * phy_power_on() loads and starts the chip, phy_power_off() stops the
++ * limiter and writes nothing (include/linux/phy/en7572.h).
++ *
++ * The diagnostics page is the read-only binary attribute "diagnostics" of
++ * the control slave's device, read from the chip at each read and only while
++ * the microcontroller runs (Documentation/ABI/testing/
++ * sysfs-bus-i2c-devices-en7572).
++ */
++
++#include <linux/bitfield.h>
++#include <linux/bits.h>
++#include <linux/delay.h>
++#include <linux/devm-helpers.h>
++#include <linux/firmware.h>
++#include <linux/i2c.h>
++#include <linux/jiffies.h>
++#include <linux/minmax.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/nvmem-consumer.h>
++#include <linux/of.h>
++#include <linux/phy/en7572.h>
++#include <linux/phy/en7581-pon.h>
++#include <linux/phy/phy.h>
++#include <linux/sfp.h>
++#include <linux/sizes.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <linux/sysfs.h>
++#include <linux/unaligned.h>
++#include <linux/workqueue.h>
++
++/* Control slave: the microcontroller's memories and its run control */
++#define CS_PROG_WRITE		0x3000
++#define CS_PROG_START		0x3004
++#define CS_PROG_PORT		0x3008
++#define CS_DATA_WRITE		0x300c
++#define CS_DATA_START		0x3010
++#define CS_DATA_PORT		0x3014
++#define CS_CORE_RUN		0x3018
++
++/*
++ * Diagnostics slave. The page below 0x100 is read in the SFP diagnostics
++ * layout for the temperature and the flag bytes; that layout is inferred,
++ * not confirmed on hardware. The rest of the page's words used here
++ * are the calibration table's: the start's own table stream writes them
++ * there before the run.
++ */
++#define DS_PAGE_SIZE		0x100
++#define DS_TEMP_OFFSET		0x0ac
++#define DS_BIAS_CEILING_HI	0x0e4
++#define DS_MOD_CEILING_HI	0x0e5
++#define DS_MOD_SLOPE		0x0e6
++#define DS_HOT_LIMIT		0x0e7
++#define DS_LIMITER_OFF		0x0e8
++#define   DS_LIMITER_OFF_BIT	BIT(0)
++#define DS_RATE			0x110
++#define   DS_RATE_XGSPON	BIT(8)
++#define DS_ANALOG_B		0x15c
++#define   DS_ANALOG_B_BIT	BIT(8)
++#define DS_ANALOG_A		0x160
++#define   DS_ANALOG_A_BIT	BIT(30)
++#define DS_CORE_RESET		0x200
++#define   DS_CORE_RESET_BITS	GENMASK(31, 30)
++#define DS_BIAS_LIMIT		0x214
++#define   DS_BIAS_LIMIT_FIELD	GENMASK(28, 16)
++#define DS_MOD_LIMIT		0x248
++#define   DS_MOD_LIMIT_FIELD	GENMASK(11, 0)
++#define DS_BIAS_NOW		0x3c4
++#define   DS_BIAS_NOW_FIELD	GENMASK(12, 0)
++#define DS_MOD_NOW		0x3c8
++#define   DS_MOD_NOW_FIELD	GENMASK(27, 16)
++#define DS_PART			0x408
++#define   DS_PART_EN7572	0x1388
++#define DS_PART_REV		0x40a
++#define DS_BURST		0x488
++#define   DS_BURST_SEEN		BIT(0)
++
++/* What the start loads, and where */
++#define LD_PROG_SIZE		SZ_16K
++#define LD_DATA_SIZE		SZ_4K
++#define LD_TABLE_SIZE		512
++#define LD_TABLE_START		0x600
++#define LD_PREP_WAIT_MS		100
++
++#define LD_FW_PROGRAM		"airoha/en7572-program.bin"
++#define LD_FW_DATA		"airoha/en7572-data.bin"
++
++/* The over-temperature limiter */
++#define OT_PACE_MIN_MS		5000
++#define OT_PACE_START_MS	5000
++#define OT_PACE_FIRST_MS	20000
++#define OT_PACE_COOLING_MS	10000
++#define OT_PACE_HOT_MS		20000
++#define OT_PACE_CLOSE_MS	5000
++#define OT_PACE_IDLE_MS		30000
++#define OT_PACE_CEILING_MS	5000
++#define OT_CLOSE		50	/* codes from a ceiling that count as close */
++#define OT_PASSES		4	/* passes that engage or release */
++#define OT_NO_REF		0xff	/* the table holds no reference temperature */
++#define OT_DEFAULT_REF		80	/* degrees C, used when it holds none */
++#define OT_BIAS_LOW_BITS	0x1e
++#define OT_MOD_LOW_BITS		0xf
++#define OT_BIAS_ROOM		0x17fe	/* below this, the default reference */
++#define OT_MOD_ROOM		0xfff
++
++/**
++ * struct pld_ot - the over-temperature limiter's state
++ * @body: the next run is a pass's body; false: its gate read
++ * @first: no burst seen yet, so no reference temperature taken
++ * @engaged: the limits are applied
++ * @t_ref: the reference temperature, degrees C
++ * @cap: the modulation code the limit is taken from
++ * @up: passes not engaged with a code at its ceiling
++ * @down: passes engaged and below the reference temperature
++ * @pace_ms: the wait before a pass's gate read and before its body
++ */
++struct pld_ot {
++	bool body;
++	bool first;
++	bool engaged;
++	int t_ref;
++	u16 cap;
++	unsigned int up;
++	unsigned int down;
++	unsigned int pace_ms;
++};
++
++/**
++ * struct pld - one laser driver chip
++ * @dev: the device of the control slave
++ * @ctl: the control slave
++ * @diag: the diagnostics slave, at the next address
++ * @table: the calibration table cells, by PON mode (GPON, XGS-PON)
++ * @phy: the generic PHY this driver provides
++ * @lock: serialises every access to the chip and the state below
++ * @ot_work: the limiter's next run
++ * @mode: the PON mode set with phy_set_mode_ext(), 0 for none
++ * @running: started, and not stopped since
++ * @limiting: the limiter runs
++ * @ot: the limiter's state
++ */
++struct pld {
++	struct device *dev;
++	struct i2c_client *ctl;
++	struct i2c_client *diag;
++	struct nvmem_cell *table[2];
++	struct phy *phy;
++	struct mutex lock;	/* the chip, and the fields below */
++	struct delayed_work ot_work;
++	int mode;
++	bool running;
++	bool limiting;
++	struct pld_ot ot;
++};
++
++static const char * const pld_table_names[] = {
++	"calibration-gpon",
++	"calibration-xgspon",
++};
++
++static const char * const pld_mode_names[] = {
++	"GPON",
++	"XGS-PON",
++};
++
++static unsigned int pld_mode_index(int mode)
++{
++	return mode == EN7581_PON_XGSPON ? 1 : 0;
++}
++
++/* Bus access */
++
++/*
++ * The register pointer goes on the wire most significant byte first.
++ */
++static void pld_put_pointer(u8 *buf, u16 reg)
++{
++	put_unaligned_be16(reg, buf);
++}
++
++static int pld_read(struct i2c_client *c, u16 reg, void *val, u16 len)
++{
++	u8 ptr[2];
++	struct i2c_msg msg[2] = {
++		{ .addr = c->addr, .len = sizeof(ptr), .buf = ptr },
++		{ .addr = c->addr, .flags = I2C_M_RD, .len = len, .buf = val },
++	};
++	int ret;
++
++	pld_put_pointer(ptr, reg);
++	ret = i2c_transfer(c->adapter, msg, ARRAY_SIZE(msg));
++	if (ret < 0)
++		return ret;
++	return ret == ARRAY_SIZE(msg) ? 0 : -EIO;
++}
++
++/* One write transfer of at most four bytes */
++static int pld_write(struct i2c_client *c, u16 reg, const void *val,
++		     u16 len)
++{
++	u8 buf[2 + sizeof(u32)];
++	int ret;
++
++	if (len > sizeof(u32))
++		return -EINVAL;
++	pld_put_pointer(buf, reg);
++	memcpy(buf + 2, val, len);
++	ret = i2c_master_send(c, buf, len + 2);
++	if (ret < 0)
++		return ret;
++	return ret == len + 2 ? 0 : -EIO;
++}
++
++static int pld_read8(struct i2c_client *c, u16 reg, u8 *val)
++{
++	return pld_read(c, reg, val, 1);
++}
++
++static int pld_read32(struct i2c_client *c, u16 reg, u32 *val)
++{
++	__le32 v;
++	int err;
++
++	err = pld_read(c, reg, &v, sizeof(v));
++	if (!err)
++		*val = le32_to_cpu(v);
++	return err;
++}
++
++static int pld_write32(struct i2c_client *c, u16 reg, u32 val)
++{
++	__le32 v = cpu_to_le32(val);
++
++	return pld_write(c, reg, &v, sizeof(v));
++}
++
++/* Read the word, then write it back with the bits of @mask set to @val. */
++static int pld_rmw32(struct i2c_client *c, u16 reg, u32 mask, u32 val)
++{
++	u32 v;
++	int err;
++
++	err = pld_read32(c, reg, &v);
++	if (err)
++		return err;
++	return pld_write32(c, reg, (v & ~mask) | (val & mask));
++}
++
++/*
++ * Fill one of the microcontroller's memories: enable writes, set the start
++ * address, then stream @len bytes of @img, zero-padded to @size, one 4-byte
++ * word per transfer, to the memory's port. The image's bytes go on the wire
++ * in their own order.
++ */
++static int pld_fill(struct pld *ld, u16 write_reg, u16 start_reg,
++		    u32 start, u16 port, const u8 *img, size_t len,
++		    size_t size)
++{
++	u8 word[sizeof(u32)];
++	size_t off;
++	int err;
++
++	err = pld_write32(ld->ctl, write_reg, 1);
++	if (err)
++		return err;
++	err = pld_write32(ld->ctl, start_reg, start);
++	if (err)
++		return err;
++
++	for (off = 0; off < size; off += sizeof(word)) {
++		memset(word, 0, sizeof(word));
++		if (off < len)
++			memcpy(word, img + off, min(len - off, sizeof(word)));
++		err = pld_write(ld->ctl, port, word, sizeof(word));
++		if (err)
++			return err;
++	}
++	return 0;
++}
++
++/* The over-temperature limiter */
++
++static void pld_ot_arm(struct pld *ld)
++{
++	unsigned int ms = max(ld->ot.pace_ms, OT_PACE_MIN_MS);
++
++	queue_delayed_work(system_wq, &ld->ot_work, msecs_to_jiffies(ms));
++}
++
++/*
++ * Engage: cap the modulation code where it stands (or at its ceiling), and
++ * if the bias code is still under its ceiling, hold it where it is too.
++ */
++static int pld_ot_engage(struct pld *ld, unsigned int bias,
++			 unsigned int mod, unsigned int bias_ceil,
++			 unsigned int mod_ceil)
++{
++	struct pld_ot *ot = &ld->ot;
++
++	ot->engaged = true;
++	ot->cap = mod < mod_ceil ? mod : mod_ceil;
++	if (bias < bias_ceil)
++		return pld_rmw32(ld->diag, DS_BIAS_LIMIT,
++				 DS_BIAS_LIMIT_FIELD,
++				 FIELD_PREP(DS_BIAS_LIMIT_FIELD, bias));
++	return 0;
++}
++
++/* Release: both limits back to their ceilings. */
++static int pld_ot_release(struct pld *ld, unsigned int bias_ceil,
++			  unsigned int mod_ceil)
++{
++	int err;
++
++	ld->ot.engaged = false;
++	err = pld_rmw32(ld->diag, DS_BIAS_LIMIT, DS_BIAS_LIMIT_FIELD,
++			FIELD_PREP(DS_BIAS_LIMIT_FIELD, bias_ceil));
++	if (err)
++		return err;
++	return pld_rmw32(ld->diag, DS_MOD_LIMIT, DS_MOD_LIMIT_FIELD,
++			 FIELD_PREP(DS_MOD_LIMIT_FIELD, mod_ceil));
++}
++
++/*
++ * The modulation limit while engaged: the cap less the slope for every
++ * degree over the reference, kept between half the cap and the cap. The
++ * rule computes it in 16 bits, so a slope and overshoot whose product
++ * exceeds the cap wrap to a large value and clamp to the full cap, lifting
++ * the limit when the laser is hottest. Signed arithmetic holds half the cap
++ * there instead; below that product the two agree.
++ */
++static u16 pld_ot_limit(u16 cap, u8 slope, int t, int t_ref)
++{
++	int n = cap - slope * (t - t_ref);
++
++	if (n > cap)
++		return cap;
++	if (n < cap / 2)
++		return cap / 2;
++	return n;
++}
++
++/* The body of one pass: items 3 to 8 of the rule. */
++static int pld_ot_pass(struct pld *ld)
++{
++	struct pld_ot *ot = &ld->ot;
++	struct i2c_client *dg = ld->diag;
++	unsigned int bias, mod, bias_ceil, mod_ceil;
++	u8 hi, offset, temp, frac, hot, slope;
++	u16 limit;
++	u32 v;
++	int err, t;
++
++	/* the drive codes, their ceilings and the temperature */
++	err = pld_read32(dg, DS_BIAS_NOW, &v);
++	if (err)
++		return err;
++	bias = FIELD_GET(DS_BIAS_NOW_FIELD, v);
++	err = pld_read32(dg, DS_MOD_NOW, &v);
++	if (err)
++		return err;
++	mod = FIELD_GET(DS_MOD_NOW_FIELD, v);
++	err = pld_read8(dg, DS_BIAS_CEILING_HI, &hi);
++	if (err)
++		return err;
++	bias_ceil = (unsigned int)hi << 5 | OT_BIAS_LOW_BITS;
++	err = pld_read8(dg, DS_MOD_CEILING_HI, &hi);
++	if (err)
++		return err;
++	mod_ceil = (unsigned int)hi << 4 | OT_MOD_LOW_BITS;
++	err = pld_read8(dg, DS_TEMP_OFFSET, &offset);
++	if (err)
++		return err;
++	err = pld_read8(dg, SFP_TEMP, &temp);
++	if (err)
++		return err;
++	/* Read the fraction byte with the integer byte; only the latter is used. */
++	err = pld_read8(dg, SFP_TEMP + 1, &frac);
++	if (err)
++		return err;
++	t = (s8)temp - offset;
++
++	/* the first pass that sees a burst takes the reference temperature */
++	if (ot->first) {
++		err = pld_read32(dg, DS_BURST, &v);
++		if (err || !(v & DS_BURST_SEEN))
++			return err;
++		ot->first = false;
++
++		err = pld_read8(dg, DS_HOT_LIMIT, &hot);
++		if (err)
++			return err;
++		if (hot != OT_NO_REF)
++			ot->t_ref = (s8)hot - offset;
++		else if (bias_ceil < OT_BIAS_ROOM && mod_ceil < OT_MOD_ROOM)
++			ot->t_ref = OT_DEFAULT_REF;
++		else
++			return 0;
++
++		if (t > ot->t_ref && (bias == bias_ceil || mod == mod_ceil)) {
++			err = pld_ot_engage(ld, bias, mod, bias_ceil,
++					    mod_ceil);
++			if (err)
++				return err;
++		}
++		ot->pace_ms = OT_PACE_FIRST_MS;
++	}
++
++	if (ot->engaged) {
++		err = pld_read8(dg, DS_MOD_SLOPE, &slope);
++		if (err)
++			return err;
++		limit = pld_ot_limit(ot->cap, slope, t, ot->t_ref);
++		err = pld_rmw32(dg, DS_MOD_LIMIT, DS_MOD_LIMIT_FIELD,
++				FIELD_PREP(DS_MOD_LIMIT_FIELD, limit));
++		if (err)
++			return err;
++	}
++
++	/*
++	 * The pace and the counters, the first case that holds. A code above
++	 * its ceiling meets none of them and changes nothing.
++	 */
++	if (ot->engaged && t < ot->t_ref) {
++		ot->down++;
++		ot->pace_ms = OT_PACE_COOLING_MS;
++	} else if (ot->engaged) {
++		ot->down = 0;
++		ot->pace_ms = OT_PACE_HOT_MS;
++	} else if (bias < bias_ceil && mod < mod_ceil) {
++		ot->up = 0;
++		if (bias_ceil - bias < OT_CLOSE || mod_ceil - mod < OT_CLOSE)
++			ot->pace_ms = OT_PACE_CLOSE_MS;
++		else
++			ot->pace_ms = OT_PACE_IDLE_MS;
++	} else if (bias == bias_ceil || mod == mod_ceil) {
++		ot->up++;
++		ot->pace_ms = OT_PACE_CEILING_MS;
++	}
++
++	if (!ot->engaged && ot->up >= OT_PASSES) {
++		ot->t_ref = t;
++		ot->up = 0;
++		ot->down = 0;
++		return pld_ot_engage(ld, bias, mod, bias_ceil, mod_ceil);
++	}
++	if (ot->engaged && ot->down >= OT_PASSES) {
++		ot->up = 0;
++		ot->down = 0;
++		return pld_ot_release(ld, bias_ceil, mod_ceil);
++	}
++	return 0;
++}
++
++/*
++ * One run of the limiter. A pass is two runs, each after the pace: the gate
++ * read, which ends the pass when the table turns the limiter off, and then
++ * the body.
++ */
++static void pld_ot_work(struct work_struct *work)
++{
++	struct pld *ld = container_of(to_delayed_work(work), struct pld,
++				      ot_work);
++	u32 v;
++	int err;
++
++	mutex_lock(&ld->lock);
++	if (!ld->limiting)
++		goto out;
++
++	if (!ld->ot.body) {
++		err = pld_read32(ld->diag, DS_LIMITER_OFF, &v);
++		if (!err && !(v & DS_LIMITER_OFF_BIT))
++			ld->ot.body = true;
++	} else {
++		ld->ot.body = false;
++		err = pld_ot_pass(ld);
++	}
++	if (err)
++		dev_warn_ratelimited(ld->dev,
++				     "limiter pass ended on a bus error: %d\n",
++				     err);
++	pld_ot_arm(ld);
++out:
++	mutex_unlock(&ld->lock);
++}
++
++static void pld_ot_start(struct pld *ld)
++{
++	ld->ot = (struct pld_ot) {
++		.first = true,
++		.pace_ms = OT_PACE_START_MS,
++	};
++	ld->limiting = true;
++	pld_ot_arm(ld);
++}
++
++/* Start */
++
++static int pld_get_image(struct pld *ld, const char *name,
++			 size_t size, const struct firmware **fw)
++{
++	int err;
++
++	err = request_firmware(fw, name, ld->dev);
++	if (err) {
++		dev_err(ld->dev, "cannot load %s: %d\n", name, err);
++		return err;
++	}
++	/* a short image is normal: the start pads it with zeros */
++	if (!(*fw)->size || (*fw)->size > size) {
++		dev_err(ld->dev, "%s is %zu bytes, not 1 to %zu\n", name,
++			(*fw)->size, size);
++		release_firmware(*fw);
++		return -EINVAL;
++	}
++	return 0;
++}
++
++/*
++ * The chip's start. The inputs are all taken
++ * first, so a missing one leaves the chip untouched; so does a part that
++ * does not identify. A bus error part way leaves it held or half loaded,
++ * and the next start begins again from the top.
++ */
++static int pld_start(struct pld *ld)
++{
++	unsigned int idx = pld_mode_index(ld->mode);
++	const struct firmware *prog, *data;
++	static const u8 zero[2];
++	__le16 part, rev;
++	size_t table_len;
++	u8 *table;
++	u32 v;
++	int err;
++
++	if (!ld->table[idx]) {
++		dev_err(ld->dev, "no calibration table for %s\n",
++			pld_mode_names[idx]);
++		return -ENOENT;
++	}
++	table = nvmem_cell_read(ld->table[idx], &table_len);
++	if (IS_ERR(table)) {
++		dev_err(ld->dev, "cannot read the %s calibration table: %pe\n",
++			pld_mode_names[idx], table);
++		return PTR_ERR(table);
++	}
++	if (table_len < LD_TABLE_SIZE) {
++		dev_err(ld->dev, "the %s calibration table is %zu bytes\n",
++			pld_mode_names[idx], table_len);
++		err = -EINVAL;
++		goto out_table;
++	}
++	/* Reject erased or blank factory data before touching the controller. */
++	if (!memchr_inv(table, 0xff, LD_TABLE_SIZE) ||
++	    !memchr_inv(table, 0x00, LD_TABLE_SIZE)) {
++		dev_err(ld->dev, "the %s calibration table is blank\n",
++			pld_mode_names[idx]);
++		err = -EINVAL;
++		goto out_table;
++	}
++
++	err = pld_get_image(ld, LD_FW_PROGRAM, LD_PROG_SIZE, &prog);
++	if (err)
++		goto out_table;
++	err = pld_get_image(ld, LD_FW_DATA, LD_DATA_SIZE, &data);
++	if (err)
++		goto out_prog;
++
++	/* 1: is it the part? Write nothing if not. */
++	err = pld_read(ld->diag, DS_PART, &part, sizeof(part));
++	if (err)
++		goto out_data;
++	err = pld_read(ld->diag, DS_PART_REV, &rev, sizeof(rev));
++	if (err)
++		goto out_data;
++	if (le16_to_cpu(part) != DS_PART_EN7572) {
++		dev_err(ld->dev, "part reads %#06x, not an EN7572\n",
++			le16_to_cpu(part));
++		err = -ENODEV;
++		goto out_data;
++	}
++	dev_dbg(ld->dev, "part revision %#06x\n", le16_to_cpu(rev));
++
++	/* 2: hold the microcontroller */
++	err = pld_write32(ld->ctl, CS_CORE_RUN, 0);
++	if (err)
++		goto out_data;
++
++	/*
++	 * 3: the two analog bits, then 100 ms. A sleeping wait is the same
++	 * to the chip: nothing is on the bus in between.
++	 */
++	err = pld_rmw32(ld->diag, DS_ANALOG_A, DS_ANALOG_A_BIT, 0);
++	if (err)
++		goto out_data;
++	err = pld_rmw32(ld->diag, DS_ANALOG_B, DS_ANALOG_B_BIT, 0);
++	if (err)
++		goto out_data;
++	msleep(LD_PREP_WAIT_MS);
++
++	/* 4: pulse the two reset bits, clear then set */
++	err = pld_rmw32(ld->diag, DS_CORE_RESET, DS_CORE_RESET_BITS, 0);
++	if (err)
++		goto out_data;
++	err = pld_rmw32(ld->diag, DS_CORE_RESET, DS_CORE_RESET_BITS,
++			DS_CORE_RESET_BITS);
++	if (err)
++		goto out_data;
++
++	/* 5: the program image */
++	err = pld_fill(ld, CS_PROG_WRITE, CS_PROG_START, 0, CS_PROG_PORT,
++		       prog->data, prog->size, LD_PROG_SIZE);
++	if (err)
++		goto out_data;
++
++	/* 6: the data image */
++	err = pld_fill(ld, CS_DATA_WRITE, CS_DATA_START, 0, CS_DATA_PORT,
++		       data->data, data->size, LD_DATA_SIZE);
++	if (err)
++		goto out_data;
++
++	/*
++	 * 7: the mode's calibration table, its first 512 bytes as stored.
++	 * Bytes 20-55 contain the vendor name and part number on the Q1000K.
++	 * Preserve the factory contents rather than substituting identifiers.
++	 * The blank-data check cannot detect arbitrary calibration corruption;
++	 * no checksum or cross-unit format validation is established.
++	 */
++	err = pld_fill(ld, CS_DATA_WRITE, CS_DATA_START, LD_TABLE_START,
++		       CS_DATA_PORT, table, LD_TABLE_SIZE, LD_TABLE_SIZE);
++	if (err)
++		goto out_data;
++
++	/* 8: clear the alarm and warning flag bytes */
++	err = pld_write(ld->diag, SFP_ALARM0, zero, sizeof(zero));
++	if (err)
++		goto out_data;
++	err = pld_write(ld->diag, SFP_WARN0, zero, sizeof(zero));
++	if (err)
++		goto out_data;
++
++	/* 9: run the microcontroller */
++	err = pld_write32(ld->ctl, CS_CORE_RUN, 1);
++	if (err)
++		goto out_data;
++	ld->running = true;
++
++	/*
++	 * 10: the limiter, unless the table turns it off. The chip runs by
++	 * now, so a gate that cannot be read leaves it running, unlimited.
++	 */
++	err = pld_read32(ld->diag, DS_LIMITER_OFF, &v);
++	if (err)
++		dev_warn(ld->dev, "cannot read the limiter gate: %d\n", err);
++	else if (!(v & DS_LIMITER_OFF_BIT))
++		pld_ot_start(ld);
++	err = 0;
++	dev_info(ld->dev, "started for %s, limiter %s\n",
++		 pld_mode_names[idx], ld->limiting ? "on" : "off");
++
++out_data:
++	release_firmware(data);
++out_prog:
++	release_firmware(prog);
++out_table:
++	kfree(table);
++	return err;
++}
++
++/* Stop: the limiter ends and its state goes; the chip is not written. */
++static void pld_stop(struct pld *ld)
++{
++	mutex_lock(&ld->lock);
++	ld->running = false;
++	ld->limiting = false;
++	mutex_unlock(&ld->lock);
++	cancel_delayed_work_sync(&ld->ot_work);
++}
++
++/* Generic PHY operations */
++
++static int pld_set_mode(struct phy *phy, enum phy_mode mode, int submode)
++{
++	struct pld *ld = phy_get_drvdata(phy);
++	int err = 0;
++
++	if (mode != PHY_MODE_ETHERNET ||
++	    (submode != EN7581_PON_GPON && submode != EN7581_PON_XGSPON))
++		return -EINVAL;
++
++	mutex_lock(&ld->lock);
++	/* a new mode takes a new start: power off first */
++	if (ld->running && submode != ld->mode)
++		err = -EBUSY;
++	else
++		ld->mode = submode;
++	mutex_unlock(&ld->lock);
++	return err;
++}
++
++static int pld_power_on(struct phy *phy)
++{
++	struct pld *ld = phy_get_drvdata(phy);
++	int err;
++
++	if (!ld->mode) {
++		dev_err(ld->dev, "no PON mode set\n");
++		return -EINVAL;
++	}
++
++	mutex_lock(&ld->lock);
++	err = pld_start(ld);
++	mutex_unlock(&ld->lock);
++	if (err)
++		pld_stop(ld);
++	return err;
++}
++
++static int pld_power_off(struct phy *phy)
++{
++	pld_stop(phy_get_drvdata(phy));
++	return 0;
++}
++
++static const struct phy_ops pld_ops = {
++	.power_on	= pld_power_on,
++	.power_off	= pld_power_off,
++	.set_mode	= pld_set_mode,
++	.owner		= THIS_MODULE,
++};
++
++/**
++ * en7572_phy_set_xgspon_rate() - set the chip's XGS-PON rate select
++ * @phy: the laser driver's PHY, started in XGS-PON
++ *
++ * Set this after starting the controller and bringing up the XGS-PON MAC.
++ * It is not used in GPON. Whether the MAC start clears it is unknown, so
++ * the MAC driver applies it after its own start sequence.
++ *
++ * Context: sleeps.
++ * Return: 0; -EINVAL if @phy is not an EN7572 or not in XGS-PON; -ENODEV
++ * if it is not started; or the bus error.
++ */
++int en7572_phy_set_xgspon_rate(struct phy *phy)
++{
++	struct pld *ld;
++	int err;
++
++	if (IS_ERR_OR_NULL(phy) || phy->ops != &pld_ops)
++		return -EINVAL;
++	ld = phy_get_drvdata(phy);
++
++	mutex_lock(&ld->lock);
++	if (!ld->running)
++		err = -ENODEV;
++	else if (ld->mode != EN7581_PON_XGSPON)
++		err = -EINVAL;
++	else
++		err = pld_rmw32(ld->diag, DS_RATE, DS_RATE_XGSPON,
++				DS_RATE_XGSPON);
++	mutex_unlock(&ld->lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(en7572_phy_set_xgspon_rate);
++
++static int pld_probe(struct i2c_client *client)
++{
++	struct device *dev = &client->dev;
++	struct phy_provider *provider;
++	struct nvmem_cell *cell;
++	struct pld *ld;
++	unsigned int i;
++	int err;
++
++	ld = devm_kzalloc(dev, sizeof(*ld), GFP_KERNEL);
++	if (!ld)
++		return -ENOMEM;
++	ld->dev = dev;
++	ld->ctl = client;
++
++	/* the diagnostics slave answers at the next address */
++	ld->diag = devm_i2c_new_dummy_device(dev, client->adapter,
++					     client->addr + 1);
++	if (IS_ERR(ld->diag))
++		return dev_err_probe(dev, PTR_ERR(ld->diag),
++				     "cannot take the diagnostics address\n");
++
++	for (i = 0; i < ARRAY_SIZE(pld_table_names); i++) {
++		cell = devm_nvmem_cell_get(dev, pld_table_names[i]);
++		if (IS_ERR(cell)) {
++			if (PTR_ERR(cell) != -ENOENT)
++				return dev_err_probe(dev, PTR_ERR(cell),
++						     "cannot take %s\n",
++						     pld_table_names[i]);
++			cell = NULL;
++		}
++		ld->table[i] = cell;
++	}
++	if (!ld->table[0] && !ld->table[1])
++		return dev_err_probe(dev, -ENOENT, "no calibration table\n");
++
++	err = devm_mutex_init(dev, &ld->lock);
++	if (err)
++		return err;
++	err = devm_delayed_work_autocancel(dev, &ld->ot_work, pld_ot_work);
++	if (err)
++		return err;
++
++	ld->phy = devm_phy_create(dev, NULL, &pld_ops);
++	if (IS_ERR(ld->phy))
++		return dev_err_probe(dev, PTR_ERR(ld->phy),
++				     "cannot create the PHY\n");
++	phy_set_drvdata(ld->phy, ld);
++	i2c_set_clientdata(client, ld);
++
++	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
++	return PTR_ERR_OR_ZERO(provider);
++}
++
++/*
++ * The diagnostics page, the diagnostics slave below 0x100, as a read-only
++ * binary attribute of the control slave's device. It is read from the chip at
++ * each read, and only while the microcontroller runs: the microcontroller
++ * keeps the page, and before it runs the page holds nothing it wrote
++ * (-ENODATA). Read the page only when asked,
++ * and the reader decides how often it asks.
++ */
++static ssize_t diagnostics_read(struct file *file, struct kobject *kobj,
++				const struct bin_attribute *attr, char *buf,
++				loff_t off, size_t count)
++{
++	struct pld *ld = i2c_get_clientdata(to_i2c_client(kobj_to_dev(kobj)));
++	int err;
++
++	mutex_lock(&ld->lock);
++	err = ld->running ? pld_read(ld->diag, off, buf, count) : -ENODATA;
++	mutex_unlock(&ld->lock);
++	return err ? err : (ssize_t)count;
++}
++
++static const BIN_ATTR_RO(diagnostics, DS_PAGE_SIZE);
++
++static const struct bin_attribute *const pld_bin_attrs[] = {
++	&bin_attr_diagnostics,
++	NULL
++};
++
++static const struct attribute_group pld_group = {
++	.bin_attrs = pld_bin_attrs,
++};
++__ATTRIBUTE_GROUPS(pld);
++
++static const struct of_device_id pld_of_match[] = {
++	{ .compatible = "airoha,en7572" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, pld_of_match);
++
++static const struct i2c_device_id pld_id[] = {
++	{ "en7572" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(i2c, pld_id);
++
++static struct i2c_driver pld_driver = {
++	.probe = pld_probe,
++	.id_table = pld_id,
++	.driver = {
++		.name = "phy-en7572",
++		.of_match_table = pld_of_match,
++		.dev_groups = pld_groups,
++	},
++};
++module_i2c_driver(pld_driver);
++
++MODULE_FIRMWARE(LD_FW_PROGRAM);
++MODULE_FIRMWARE(LD_FW_DATA);
++MODULE_DESCRIPTION("Airoha EN7572 PON laser driver");
++MODULE_LICENSE("GPL");
+diff --git a/include/linux/phy/en7572.h b/include/linux/phy/en7572.h
+new file mode 100644
+index 0000000..d0ba6d6
+--- /dev/null
++++ b/include/linux/phy/en7572.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Airoha EN7572 PON laser driver: what a PON MAC needs beyond the generic
++ * PHY API.
++ *
++ * The chip is a generic PHY. The MAC (or whatever picks the PON mode) selects
++ * the mode with phy_set_mode_ext(phy, PHY_MODE_ETHERNET, EN7581_PON_GPON or
++ * EN7581_PON_XGSPON) from <linux/phy/en7581-pon.h>, then phy_power_on()
++ * loads and starts the chip with that mode's calibration table. To change
++ * mode: phy_power_off(), phy_set_mode_ext() with the other mode,
++ * phy_power_on(). phy_power_off() writes nothing to the chip.
++ *
++ * In XGS-PON the chip also needs its rate select, which the MAC sets with
++ * en7572_phy_set_xgspon_rate() once its XGS-PON MAC is up.
++ *
++ * Context: every function here sleeps (the chip is on I2C).
++ */
++
++#ifndef __LINUX_PHY_EN7572_H
++#define __LINUX_PHY_EN7572_H
++
++struct phy;
++
++int en7572_phy_set_xgspon_rate(struct phy *phy);
++
++#endif /* __LINUX_PHY_EN7572_H */

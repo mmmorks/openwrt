@@ -1,0 +1,3959 @@
+From ebfba43dfb20d1c19462721eaefe434c1c65f41e Mon Sep 17 00:00:00 2001
+From: John Morkel <john@morkel.me>
+Date: Sun, 18 Oct 2026 21:00:00 +0000
+Subject: [PATCH] phy: airoha: add the EN7581 PON PHY
+
+Add the PHY provider and its build entries alongside the existing Airoha PHYs.
+The tables describe GPON and XGS-PON register sequences. The MAC chooses
+the line mode through the generic PHY interface.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+ drivers/phy/airoha/Kconfig               |   14 +
+ drivers/phy/airoha/Makefile              |    3 +
+ drivers/phy/airoha/phy-en7581-pon-core.c | 2329 ++++++++++++++++++++++
+ drivers/phy/airoha/phy-en7581-pon-seq.c  | 1235 ++++++++++++
+ drivers/phy/airoha/phy-en7581-pon-seq.h  |   36 +
+ drivers/phy/airoha/phy-en7581-pon.h      |   64 +
+ include/linux/phy/en7581-pon.h           |  207 ++
+ 7 files changed, 3888 insertions(+)
+ create mode 100644 drivers/phy/airoha/phy-en7581-pon-core.c
+ create mode 100644 drivers/phy/airoha/phy-en7581-pon-seq.c
+ create mode 100644 drivers/phy/airoha/phy-en7581-pon-seq.h
+ create mode 100644 drivers/phy/airoha/phy-en7581-pon.h
+ create mode 100644 include/linux/phy/en7581-pon.h
+
+diff --git a/drivers/phy/airoha/Kconfig b/drivers/phy/airoha/Kconfig
+index 313ef29..f5ec452 100644
+--- a/drivers/phy/airoha/Kconfig
++++ b/drivers/phy/airoha/Kconfig
+@@ -41,3 +41,17 @@ config PHY_AIROHA_AN7583_USB
+ 	  Say 'Y' here to add support for Airoha AN7583 USB PHY driver.
+ 	  This driver create the basic PHY instance and provides initialize
+ 	  callback for USB port.
++
++config PHY_EN7581_PON
++	tristate "Airoha EN7581 PON PHY driver"
++	depends on ARCH_AIROHA || COMPILE_TEST
++	depends on OF
++	select GENERIC_PHY
++	select MFD_SYSCON
++	help
++	  Say Y here to add support for the PON PHY of the Airoha EN7581
++	  SoC: the serdes facing the optical module and the line block
++	  behind it, for GPON and XGS-PON. A PON MAC driver uses it.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called phy-en7581-pon.
+diff --git a/drivers/phy/airoha/Makefile b/drivers/phy/airoha/Makefile
+index 68889ff..45973d4 100644
+--- a/drivers/phy/airoha/Makefile
++++ b/drivers/phy/airoha/Makefile
+@@ -4,3 +4,6 @@ obj-$(CONFIG_PHY_AIROHA_AN7583_PCIE)	+= phy-an7583-pcie.o
+ obj-$(CONFIG_PHY_AIROHA_PCIE)		+= phy-airoha-pcie.o
+ obj-$(CONFIG_PHY_AIROHA_USB)		+= phy-airoha-usb.o
+ obj-$(CONFIG_PHY_AIROHA_AN7583_USB)	+= phy-airoha-an7583-usb.o
++
++obj-$(CONFIG_PHY_EN7581_PON)		+= phy-en7581-pon.o
++phy-en7581-pon-y			:= phy-en7581-pon-core.o phy-en7581-pon-seq.o
+diff --git a/drivers/phy/airoha/phy-en7581-pon-core.c b/drivers/phy/airoha/phy-en7581-pon-core.c
+new file mode 100644
+index 0000000..708b01c
+--- /dev/null
++++ b/drivers/phy/airoha/phy-en7581-pon-core.c
+@@ -0,0 +1,2329 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Airoha EN7581 PON PHY driver
++ *
++ * The PON PHY is the serdes that faces the optical module plus a line block
++ * that finds downstream frame sync, latches link events, counts errors and
++ * shapes the upstream bursts. It runs GPON (ITU-T G.984) and XGS-PON
++ * (ITU-T G.9807.1). This driver brings it up in either mode, keeps the
++ * downstream link with a periodic poll, and gives a PON MAC driver the
++ * settings and counters it needs (include/linux/phy/en7581-pon.h).
++ */
++
++#include <linux/bitfield.h>
++#include <linux/delay.h>
++#include <linux/devm-helpers.h>
++#include <linux/gpio/consumer.h>
++#include <linux/io.h>
++#include <linux/math.h>
++#include <linux/mfd/syscon.h>
++#include <linux/module.h>
++#include <linux/mutex.h>
++#include <linux/of.h>
++#include <linux/phy/en7581-pon.h>
++#include <linux/phy/phy.h>
++#include <linux/platform_device.h>
++#include <linux/regmap.h>
++#include <linux/reset.h>
++#include <linux/spinlock.h>
++#include <linux/unaligned.h>
++#include <linux/workqueue.h>
++
++#include "phy-en7581-pon.h"
++
++/* Line block, GPON half */
++#define LG_PMA_REG		0x104
++#define   LG_PMA_OK		BIT(0)
++#define LG_RX_CLK_REG		0x108
++#define   LG_RX_CLK_HOLD	BIT(31)
++#define LG_DELAY_REG		0x110
++#define   LG_BIT_DELAY		GENMASK(22, 19)
++#define   LG_BIT_DELAY_ON	BIT(23)
++#define LG_FRAMING_REG		0x124
++#define   LG_GPON_ON		BIT(31)
++#define LG_SYNC_REG		0x130
++#define   LG_SYNC_STATE		GENMASK(20, 18)
++#define   LG_SYNC_LOCKED	6
++#define LG_OPTIC_REG		0x138
++#define   LG_OPTIC_RX_SD_INV	BIT(6)
++#define LG_RX_FEC_REG		0x21c
++#define   LG_RX_FEC_SEEN	BIT(15)
++#define LG_CNT_EN_REG		0x230
++#define   LG_CNT_EN_FEC		BIT(0)
++#define   LG_CNT_EN_BIP		BIT(1)
++#define   LG_CNT_EN_FRAMES	BIT(2)
++#define LG_CNT_CMD_REG		0x234
++#define   LG_CNT_FEC_LATCH	0x01
++#define   LG_CNT_FEC_RESTART	0x02
++#define   LG_CNT_BIP_LATCH	0x04
++#define   LG_CNT_BIP_RESTART	0x08
++#define   LG_CNT_FRAMES_LATCH	0x10
++#define   LG_CNT_FRAMES_RESTART	0x20
++#define LG_FEC_BYTES_REG	0x238
++#define LG_FEC_FIXED_REG	0x23c
++#define LG_FEC_LOST_REG		0x240
++#define LG_FEC_TOTAL_REG	0x244
++#define LG_FEC_SECS_REG		0x248
++#define LG_BIP_REG		0x24c
++#define LG_FRAMES_LO_REG	0x250
++#define LG_FRAMES_HI_REG	0x254
++#define LG_LOF_REG		0x258
++#define LG_FEC_DECODE_REG	0x268
++#define LG_RTT_REG		0x2d4
++#define   LG_RTT		GENMASK(15, 0)
++#define LG_OVERHEAD_REG		0x400
++#define   LG_OH_GUARD		GENMASK(7, 0)
++#define   LG_OH_TYPE2		GENMASK(15, 8)
++#define   LG_OH_TYPE1		GENMASK(23, 16)
++#define   LG_OH_TYPE3		GENMASK(31, 24)
++#define LG_DELIM_REG		0x404
++#define   LG_DELIM_FILL		GENMASK(31, 24)
++#define   LG_DELIM_FILL_BYTE	0xaa
++#define LG_BURST_REG		0x408
++#define   LG_BURST_RANGING	GENMASK(7, 0)
++#define   LG_BURST_OPERATION	GENMASK(15, 8)
++#define   LG_BURST_EXT_ON	BIT(16)
++#define   LG_BURST_STATE	GENMASK(18, 17)
++#define   LG_BURST_ALL		GENMASK(18, 0)
++#define   LG_STATE_RANGING	2
++#define   LG_STATE_OPERATION	3
++#define LG_TX_FEC_REG		0x40c
++#define   LG_TX_FEC_SEEN	BIT(15)
++#define LG_LOS_REG		0x5e0
++#define   LG_NO_LIGHT		BIT(0)
++#define LG_EVENT_MASK_REG	0x5f0
++#define   LG_EVENTS_ON		0x123
++#define LG_EVENT_CLR_REG	0x5f4
++#define LG_EVENTS_REG		0x5f8
++#define   LG_EV_LIGHT_LOST	BIT(0)
++#define   LG_EV_SYNC		BIT(5)
++#define   LG_EV_LIGHT_BACK	BIT(8)
++
++/* Line block, XGS-PON half */
++#define LX_RX_REG		0xa04
++#define   LX_RX_ON		BIT(16)
++#define LX_RUN_REG		0xa0c
++#define   LX_RUN_HOLD		0
++#define   LX_RUN_GO		3
++#define LX_EVENTS_REG		0xa10
++#define   LX_EV_LIGHT_LOST	BIT(0)
++#define   LX_EV_SYNC		BIT(1)
++#define   LX_EV_FRAME_LOST	BIT(2)
++#define   LX_EV_RX_READY	BIT(9)
++#define LX_EVENT_MASK_REG	0xa14
++#define   LX_EVENTS_ON		0x3d026f
++#define LX_PRE_HI_REG(n)	(0xa18 + 8 * (n))
++#define LX_PRE_LO_REG(n)	(0xa1c + 8 * (n))
++#define LX_DELIM_HI_REG(n)	(0xa38 + 8 * (n))
++#define LX_DELIM_LO_REG(n)	(0xa3c + 8 * (n))
++#define LX_BURST_FEC_REG	0xa58
++#define   LX_BURST_FEC(n)	BIT(8 * (n))
++#define LX_BURST_SHAPE_REG(n)	(0xa5c + 4 * (n))
++#define   LX_SHAPE_DELIM_LEN	GENMASK(3, 0)
++#define   LX_SHAPE_PRE_LEN	GENMASK(11, 8)
++#define   LX_SHAPE_PRE_REPEAT	GENMASK(23, 16)
++#define LX_BURST_PROFILES	4
++#define LX_TX_CONT_REG		0xa78
++#define   LX_TX_CONT_ON		BIT(0)
++#define   LX_TX_CONT_PATTERN	GENMASK(9, 8)
++#define   LX_TX_CONT_IN_GRANTS	BIT(16)
++#define LX_CTRL_REG		0xa84
++#define   LX_FEC_DEC_ON		BIT(4)
++#define   LX_FEC_DEC_AUTO	(BIT(1) | BIT(5))
++#define   LX_FEC_DEC_ALL	(BIT(1) | BIT(4) | BIT(5) | BIT(6))
++#define   LX_CNT_RESTART	BIT(16)
++#define LX_FRAMES_REG		0xa90
++#define LX_LOF_REG		0xb18
++#define LX_SYNC_REG		0xb1c
++#define   LX_SYNCED		BIT(1)
++#define LX_FEC_LOST_REG		0xb24
++#define LX_FEC_FIXED_REG	0xb28
++#define LX_PROBE_SEL_REG	0xb30
++#define   LX_PROBE_SEL		GENMASK(3, 0)
++#define   LX_PROBE_SEL_FEC	3
++#define LX_PROBE_REG		0xb38
++#define   LX_PROBE_RX_FEC	BIT(2)
++#define LX_SD_LEVEL_REG		0xb48
++#define LX_LOS_REG		0xb4c
++#define   LX_NO_LIGHT		BIT(0)
++#define LX_FEC_TOTAL_REG	0xba4
++#define LX_FEC_BYTES_REG	0xba8
++#define LX_FEC_SECS_REG		0xbbc
++#define LX_TX_FEC_REG		0xbcc
++#define   LX_TX_FEC_SEEN	BIT(0)
++
++/* Serdes window: the analog half, then the PMA half */
++#define ANA_CDR_INJ_REG		(SERDES_ANA + 0x0f4)
++#define   ANA_CDR_INJ_OFF	BIT(24)
++#define PMA_EQ_WAIT_REG		(SERDES_PMA + 0x118)
++#define   PMA_EQ_WAIT		GENMASK(7, 0)
++#define PMA_FDET_GO_REG		(SERDES_PMA + 0x158)
++#define   PMA_FDET_GO		GENMASK(2, 0)
++#define   PMA_FDET_START	3
++#define PMA_PI_GAIN_REG		(SERDES_PMA + 0x15c)
++#define   PMA_PI_GAIN		GENMASK(10, 8)
++#define PMA_FLL_CODE_REG	(SERDES_PMA + 0x174)
++#define   PMA_FLL_CODE		GENMASK(10, 0)
++#define PMA_FLL_LOAD_REG	(SERDES_PMA + 0x19c)
++#define   PMA_FLL_LOAD		BIT(0)
++#define PMA_TEST_PAT_REG	(SERDES_PMA + 0x210)
++#define   PMA_TEST_PAT		GENMASK(4, 0)
++#define   PMA_TEST_PAT_SEND	BIT(8)
++#define PMA_EYE_OK_REG		(SERDES_PMA + 0x248)
++#define   PMA_EYE_OK		BIT(16)
++#define PMA_EYE_EDGES_REG	(SERDES_PMA + 0x25c)
++#define   PMA_EYE_LEFT		GENMASK(26, 16)
++#define   PMA_EYE_RIGHT		GENMASK(10, 0)
++#define PMA_OPTIC_A_REG		(SERDES_PMA + 0x270)
++#define   PMA_OPTIC_BEN_INV	BIT(8)
++#define   PMA_OPTIC_RX_SD_INV	BIT(16)
++#define   PMA_OPTIC_FAULT_INV	BIT(24)
++#define PMA_OPTIC_B_REG		(SERDES_PMA + 0x274)
++#define   PMA_OPTIC_TX_SD_INV	BIT(0)
++#define PMA_EVENTS_REG		(SERDES_PMA + 0x288)
++#define PMA_CDR_FILT_RUN_REG	(SERDES_PMA + 0x294)
++#define   PMA_CDR_FILT_RUN	BIT(24)
++#define PMA_CDR_FILT_SEL_REG	(SERDES_PMA + 0x300)
++#define   PMA_CDR_FILT_SEL	BIT(24)
++#define PMA_TX_NORMAL_REG	(SERDES_PMA + 0x404)
++#define   PMA_TX_NORMAL		BIT(24)
++#define PMA_TX_FORCE_REG	(SERDES_PMA + 0x408)
++#define   PMA_TX_FORCE		GENMASK(31, 16)
++#define PMA_TX_SRC_REG		(SERDES_PMA + 0x414)
++#define   PMA_TX_RX_CLK		BIT(8)
++#define   PMA_TX_PATTERN	BIT(16)
++#define PMA_BEN_SRC_REG		(SERDES_PMA + 0x468)
++#define   PMA_BEN_SRC		GENMASK(30, 28)
++#define   PMA_BEN_NORMAL	1
++#define PMA_FDET_REG		(SERDES_PMA + 0x530)
++#define   PMA_FDET_COUNT	GENMASK(31, 16)
++#define   PMA_FDET_LOCKED	BIT(0)
++#define PMA_CLK_SEL_REG		(SERDES_PMA + 0x60c)
++#define   PMA_CLK_SEL		GENMASK(1, 0)
++#define   PMA_CLK_SEL_TEST	3
++#define PMA_FE_PEAK_REG		(SERDES_PMA + 0x768)
++#define   PMA_FE_PEAK_FORCE	BIT(24)
++#define   PMA_FE_PEAK		GENMASK(19, 16)
++#define PMA_CDR_CODE_REG	(SERDES_PMA + 0x794)
++#define   PMA_CDR_CODE_FORCE	BIT(16)
++#define   PMA_CDR_CODE		GENMASK(10, 0)
++#define PMA_CDR_FILT_REG	(SERDES_PMA + 0x820)
++#define   PMA_CDR_R_FORCE	BIT(24)
++#define   PMA_CDR_R		BIT(16)
++#define   PMA_CDR_C_FORCE	BIT(8)
++#define   PMA_CDR_C		BIT(0)
++#define PMA_CDR_PWR_REG		(SERDES_PMA + 0x824)
++#define   PMA_PR_PWR_FORCE	BIT(24)
++#define   PMA_PR_PWR		BIT(16)
++#define   PMA_EYE_PWR_FORCE	BIT(8)
++#define   PMA_EYE_PWR		BIT(0)
++#define PMA_FE_GAIN_REG		(SERDES_PMA + 0x88c)
++#define   PMA_FE_GAIN_FORCE	BIT(8)
++#define   PMA_FE_GAIN		GENMASK(1, 0)
++
++/* System controller (shared) */
++#define SCU_LINE_SEL_REG	0x070
++#define   SCU_LINE_SEL		GENMASK(7, 0)
++#define   SCU_LINE_GPON		0x00
++#define   SCU_LINE_XGSPON	0x0a
++#define SCU_TX_PIN_REG		0x860
++#define   SCU_TX_PIN		BIT(10)
++#define SCU_BUS_REG		0x92c
++#define   SCU_BUS_OK		BIT(2)
++
++/* Chip-level controller (shared) */
++#define CHIP_PON_PINS_REG	0x21c
++#define   CHIP_PON_PINS		BIT(0)
++#define CHIP_GPIO_FORCE_REG	0x22c
++#define   CHIP_FORCE_BEN	BIT(9)
++#define   CHIP_FORCE_GPIO32	BIT(0)
++
++/* Line settings for the optical module the Q1000K carries */
++#define OPTIC_LX_SD_LEVEL	0x9
++#define OPTIC_LG_LINE		0x14f
++#define OPTIC_PMA_A		0x10001
++#define OPTIC_PMA_B		0x1010100
++
++/* Frequency detector count the CDR current search aims for */
++#define CDR_FDET_TARGET		0xa49a
++#define CDR_MEASURE_US		5000
++
++#define EYE_PEAK_STEPS		8
++
++#define POLL_MS			1500
++#define POLL_MISS_MS		3500
++#define POLL_QUICK_MS		50
++#define POLL_ACT_MIN_MS		100
++#define WATCH_MS		10
++#define RX_SETTLE_MS		350
++
++enum pon_link {
++	PON_LINK_UNKNOWN,
++	PON_LINK_LOST,
++	PON_LINK_READY,
++};
++
++/**
++ * struct en7581_pon - one PON PHY
++ * @dev: the platform device
++ * @phy: the generic PHY
++ * @line: the line block registers
++ * @serdes: the serdes registers, analog then PMA half
++ * @scu: the system controller
++ * @chip: the chip-level controller
++ * @rst: the PHY's reset line
++ * @tx_off: the optical module's transmit-disable line, asserted to turn
++ *	its transmitter off; NULL when the board has none
++ * @tx_lock: guards @tx_allowed, @tx_held and the line they drive
++ * @tx_allowed: the MAC's last transmitter call; set again by init
++ * @tx_held: the PHY's own switch: set from its turning the transmitter off
++ *	(a reset, exit) until it turns it on again. The line is released only
++ *	while @tx_allowed is set and @tx_held clear.
++ * @reg_lock: makes each read-modify-write of @line and @serdes atomic
++ * @lock: guards the state below and serialises the operations that sleep
++ * @poll: the link poll
++ * @watch: the event watch, which stands in for the interrupt line while the
++ *	MAC asks for it (en7581_pon_phy_watch_events())
++ * @watching: the MAC's last watch call; cleared by exit
++ * @xgs: the line mode is XGS-PON (else GPON)
++ * @line_set: a line was programmed since load, the one @xgs names; the
++ *	serdes keeps what it wrote across the reset line
++ * @programmed: the line mode is selected and the PHY programmed since the
++ *	last pulse of its reset line
++ * @powered: the PHY is powered on; read without @lock by the register-only
++ *	operations
++ * @link: what the PHY last concluded about the downstream link
++ * @full_rx_due: the next "light back" runs the whole receiver bring-up
++ * @rx_done: clear from programming in the dark until the whole receiver
++ *	bring-up next runs outside it (the GPON dark bring-up, a light back or
++ *	a test pattern's catch-up); programming in the light sets it
++ * @light_seen: GPON: light came back and the serdes was reset, no sync yet
++ * @stray_event: XGS-PON: an event no rule names has latched since the link
++ *	was last lost
++ * @poll_ms: the stored poll interval, in ms
++ * @next_poll: the delay, in ms, of the latest arming of the next poll
++ * @link_fn: the MAC's link report
++ * @link_data: its argument
++ */
++struct en7581_pon {
++	struct device *dev;
++	struct phy *phy;
++	void __iomem *line;
++	void __iomem *serdes;
++	struct regmap *scu;
++	struct regmap *chip;
++	struct reset_control *rst;
++	struct gpio_desc *tx_off;
++	spinlock_t tx_lock;	/* tx_allowed, tx_held and the line */
++	bool tx_allowed;
++	bool tx_held;
++
++	spinlock_t reg_lock;	/* each read-modify-write of line, serdes */
++	struct mutex lock;	/* the state below, the sleeping operations */
++	struct delayed_work poll;
++	struct delayed_work watch;
++	bool watching;
++
++	bool xgs;
++	bool line_set;
++	bool programmed;
++	bool powered;
++	enum pon_link link;
++	bool full_rx_due;
++	bool rx_done;
++	bool light_seen;
++	bool stray_event;
++	unsigned int poll_ms;
++	unsigned int next_poll;
++
++	en7581_pon_link_fn link_fn;
++	void *link_data;
++};
++
++static const struct phy_ops en7581_pon_ops;
++
++/* Register access */
++
++static void __iomem *lb(struct en7581_pon *p, u32 off)
++{
++	return p->line + off;
++}
++
++static void __iomem *sd(struct en7581_pon *p, u32 off)
++{
++	return p->serdes + off;
++}
++
++static void __pon_rmw(void __iomem *reg, u32 mask, u32 val)
++{
++	writel((readl(reg) & ~mask) | (val & mask), reg);
++}
++
++static void pon_rmw(struct en7581_pon *p, void __iomem *reg, u32 mask, u32 val)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&p->reg_lock, flags);
++	__pon_rmw(reg, mask, val);
++	spin_unlock_irqrestore(&p->reg_lock, flags);
++}
++
++static void pon_bit(struct en7581_pon *p, void __iomem *reg, u32 bit, bool on)
++{
++	pon_rmw(p, reg, bit, on ? bit : 0);
++}
++
++static void pon_field(struct en7581_pon *p, void __iomem *reg, u32 mask,
++		      u32 val)
++{
++	pon_rmw(p, reg, mask, (val << __ffs(mask)) & mask);
++}
++
++static void pon_wr(struct en7581_pon *p, void __iomem *reg, u32 val)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&p->reg_lock, flags);
++	writel(val, reg);
++	spin_unlock_irqrestore(&p->reg_lock, flags);
++}
++
++/* Read a latched-event word and write it back to clear what it holds. */
++static u32 pon_ack(struct en7581_pon *p, void __iomem *reg)
++{
++	u32 val = readl(reg);
++
++	pon_wr(p, reg, val);
++	return val;
++}
++
++static unsigned int pon_col(struct en7581_pon *p)
++{
++	return p->xgs ? PON_LINE_IDX_XGSPON : PON_LINE_IDX_GPON;
++}
++
++/* Run one of the fixed serdes sequences in the current line mode. */
++static void pon_run(struct en7581_pon *p, enum pon_seq_id id)
++{
++	const struct pon_seq *seq = &pon_seqs[id][pon_col(p)];
++	unsigned int i;
++
++	WARN_ON_ONCE(!seq->len);
++	for (i = 0; i < seq->len; i++) {
++		const struct pon_step *s = &seq->steps[i];
++
++		if (s->reg == PON_STEP_PAUSE)
++			fsleep(s->val);
++		else
++			pon_rmw(p, sd(p, s->reg), GENMASK(s->hi, s->lo),
++				s->val << s->lo);
++	}
++}
++
++/*
++ * The PHY's own switch of the optical module's transmitter. No register
++ * access: the PHY drives the module's transmit-disable line, and nothing else
++ * drives it. Off is at once. On releases the line only if the MAC's last call
++ * allows it, so a reset never undoes the MAC turning the transmitter off.
++ */
++static void pon_tx(struct en7581_pon *p, bool on)
++{
++	unsigned long flags;
++
++	spin_lock_irqsave(&p->tx_lock, flags);
++	p->tx_held = !on;
++	if (!on || p->tx_allowed)
++		gpiod_set_value(p->tx_off, !on);
++	spin_unlock_irqrestore(&p->tx_lock, flags);
++}
++
++/* Link tests */
++
++static bool pon_light(struct en7581_pon *p)
++{
++	if (p->xgs)
++		return !(readl(lb(p, LX_LOS_REG)) & LX_NO_LIGHT);
++	return !(readl(lb(p, LG_LOS_REG)) & LG_NO_LIGHT);
++}
++
++static bool pon_ready(struct en7581_pon *p)
++{
++	if (p->xgs)
++		return readl(lb(p, LX_SYNC_REG)) & LX_SYNCED;
++	return FIELD_GET(LG_SYNC_STATE, readl(lb(p, LG_SYNC_REG))) ==
++	       LG_SYNC_LOCKED;
++}
++
++/* Receiver calibration */
++
++static u32 pon_cdr_count(struct en7581_pon *p, u32 code)
++{
++	pon_field(p, sd(p, PMA_CDR_CODE_REG), PMA_CDR_CODE, code);
++	pon_field(p, sd(p, PMA_FDET_GO_REG), PMA_FDET_GO, PMA_FDET_START);
++	fsleep(CDR_MEASURE_US);
++	return FIELD_GET(PMA_FDET_COUNT, readl(sd(p, PMA_FDET_REG)));
++}
++
++/*
++ * Find the phase-rotator current at which the frequency detector's count
++ * crosses its target, a binary search with a coarse first pass over the top
++ * three bits, and hand that code to the frequency-lock loop. Returns whether
++ * the detector reported lock at the chosen code.
++ */
++static bool pon_cdr_search(struct en7581_pon *p)
++{
++	void __iomem *filt = sd(p, PMA_CDR_FILT_REG);
++	void __iomem *pwr = sd(p, PMA_CDR_PWR_REG);
++	u32 best = 0, code;
++	bool locked;
++	int i;
++
++	pon_bit(p, sd(p, ANA_CDR_INJ_REG), ANA_CDR_INJ_OFF, true);
++	pon_bit(p, filt, PMA_CDR_R_FORCE, true);
++	pon_bit(p, filt, PMA_CDR_R, true);
++	pon_bit(p, filt, PMA_CDR_C_FORCE, true);
++	pon_bit(p, filt, PMA_CDR_C, true);
++	pon_bit(p, sd(p, PMA_CDR_CODE_REG), PMA_CDR_CODE_FORCE, true);
++	pon_bit(p, pwr, PMA_PR_PWR_FORCE, true);
++	pon_bit(p, pwr, PMA_PR_PWR, false);
++	pon_bit(p, pwr, PMA_PR_PWR, true);
++
++	for (i = 1; i <= 7; i++)
++		if (pon_cdr_count(p, i << 8) > CDR_FDET_TARGET)
++			best = i << 8;
++
++	for (i = 7; i >= 0; i--) {
++		code = best | BIT(i);
++		if (pon_cdr_count(p, code) < CDR_FDET_TARGET)
++			code &= ~BIT(i);
++		best = code;
++	}
++
++	pon_field(p, sd(p, PMA_CDR_CODE_REG), PMA_CDR_CODE, best);
++	pon_field(p, sd(p, PMA_FDET_GO_REG), PMA_FDET_GO, PMA_FDET_START);
++	locked = readl(sd(p, PMA_FDET_REG)) & PMA_FDET_LOCKED;
++
++	pon_bit(p, sd(p, ANA_CDR_INJ_REG), ANA_CDR_INJ_OFF, false);
++	pon_bit(p, filt, PMA_CDR_R_FORCE, true);
++	pon_bit(p, filt, PMA_CDR_R, true);
++	pon_bit(p, filt, PMA_CDR_C_FORCE, false);
++	pon_bit(p, filt, PMA_CDR_C, false);
++	pon_bit(p, sd(p, PMA_CDR_CODE_REG), PMA_CDR_CODE_FORCE, false);
++	pon_bit(p, sd(p, PMA_FLL_LOAD_REG), PMA_FLL_LOAD, true);
++	pon_field(p, sd(p, PMA_FLL_CODE_REG), PMA_FLL_CODE, best);
++	pon_bit(p, pwr, PMA_PR_PWR, false);
++	pon_bit(p, pwr, PMA_PR_PWR, true);
++	pon_bit(p, pwr, PMA_PR_PWR_FORCE, true);
++
++	return locked;
++}
++
++static void pon_fe_gain_peak(struct en7581_pon *p, u32 peak)
++{
++	pon_bit(p, sd(p, PMA_FE_PEAK_REG), PMA_FE_PEAK_FORCE, true);
++	pon_field(p, sd(p, PMA_FE_PEAK_REG), PMA_FE_PEAK, peak);
++}
++
++static void pon_fe_gain(struct en7581_pon *p)
++{
++	pon_bit(p, sd(p, PMA_FE_GAIN_REG), PMA_FE_GAIN_FORCE, true);
++	pon_field(p, sd(p, PMA_FE_GAIN_REG), PMA_FE_GAIN, 1);
++}
++
++/*
++ * XGS-PON: try every receive peaking setting, measure the eye opening at
++ * each, and keep the first setting with the widest opening.
++ */
++static void pon_peaking_pick(struct en7581_pon *p)
++{
++	u32 peak, best_peak = 0, width, best_width = 0, left, right;
++	bool ok;
++
++	pon_bit(p, sd(p, PMA_CDR_PWR_REG), PMA_EYE_PWR, true);
++	pon_bit(p, sd(p, PMA_CDR_PWR_REG), PMA_EYE_PWR_FORCE, true);
++	pon_run(p, PON_SEQ_EYE_PREP);
++	pon_field(p, sd(p, PMA_EQ_WAIT_REG), PMA_EQ_WAIT, 0x80);
++	pon_field(p, sd(p, PMA_PI_GAIN_REG), PMA_PI_GAIN, 4);
++	pon_fe_gain(p);
++
++	for (peak = 0; peak < EYE_PEAK_STEPS; peak++) {
++		pon_fe_gain_peak(p, peak);
++		pon_run(p, PON_SEQ_EYE_PHASE_RECAL);
++		pon_run(p, PON_SEQ_EYE_START);
++		pon_run(p, PON_SEQ_EYE_LATCH);
++		ok = readl(sd(p, PMA_EYE_OK_REG)) & PMA_EYE_OK;
++		left = FIELD_GET(PMA_EYE_LEFT, readl(sd(p, PMA_EYE_EDGES_REG)));
++		right = FIELD_GET(PMA_EYE_RIGHT, readl(sd(p, PMA_EYE_EDGES_REG)));
++		if (!ok) {
++			/* Restart the CDR loop filter before going on. */
++			pon_bit(p, sd(p, PMA_CDR_FILT_SEL_REG),
++				PMA_CDR_FILT_SEL, false);
++			pon_bit(p, sd(p, PMA_CDR_FILT_RUN_REG),
++				PMA_CDR_FILT_RUN, false);
++			fsleep(500);
++			pon_bit(p, sd(p, PMA_CDR_FILT_RUN_REG),
++				PMA_CDR_FILT_RUN, true);
++			fsleep(500);
++		}
++		pon_run(p, PON_SEQ_EYE_STOP);
++
++		width = abs_diff(left, right);
++		if (width > best_width) {
++			best_width = width;
++			best_peak = peak;
++		}
++	}
++
++	pon_fe_gain(p);
++	pon_fe_gain_peak(p, best_peak);
++}
++
++/* Bring-up building blocks */
++
++static void pon_serdes_setup(struct en7581_pon *p)
++{
++	pon_run(p, PON_SEQ_SERDES_PREP);
++	pon_run(p, PON_SEQ_TXPLL_SETUP);
++	pon_run(p, PON_SEQ_TX_RATE);
++	pon_run(p, PON_SEQ_SERDES_COMMON_MID);
++	pon_run(p, PON_SEQ_RX_RATE);
++	pon_run(p, PON_SEQ_ANALOG_RATE);
++	pon_run(p, PON_SEQ_SERDES_COMMON_TAIL);
++	pon_run(p, PON_SEQ_CLOCKS_UP);
++}
++
++static void pon_rx_bringup(struct en7581_pon *p)
++{
++	pon_run(p, PON_SEQ_RX_START);
++	/* One retry; its result is not checked. */
++	if (!pon_cdr_search(p))
++		pon_cdr_search(p);
++	pon_run(p, PON_SEQ_RX_TRIM);
++	if (p->xgs)
++		pon_peaking_pick(p);
++	pon_run(p, PON_SEQ_RX_FINISH);
++}
++
++/* The whole bring-up here sets rx_done, whatever the light. */
++static void pon_light_back(struct en7581_pon *p)
++{
++	if (p->full_rx_due) {
++		pon_rx_bringup(p);
++		p->full_rx_due = false;
++		p->rx_done = true;
++	} else {
++		pon_run(p, PON_SEQ_RX_RELOCK);
++	}
++}
++
++/*
++ * GPON programmed in the dark, at load or by a whole-PHY reset since: bring
++ * the receiver up once more so the transmitter's burst enable is not left
++ * asserted. It runs at most once in a row, as it sets rx_done.
++ */
++static void pon_gpon_dark_bringup(struct en7581_pon *p)
++{
++	if (p->xgs || p->rx_done)
++		return;
++	pon_rx_bringup(p);
++	pon_run(p, PON_SEQ_RX_HOLD);
++	p->full_rx_due = false;
++	p->rx_done = true;
++}
++
++/*
++ * A test pattern while the whole bring-up is still due: XGS-PON powered on in
++ * the dark, or GPON after a whole-PHY reset in the dark. The receiver
++ * bring-up has not run since, and the transmitter has stayed off.
++ */
++static void pon_test_pattern_catch_up(struct en7581_pon *p)
++{
++	if (!p->full_rx_due)
++		return;
++	pon_rx_bringup(p);
++	p->full_rx_due = false;
++	p->rx_done = true;
++	pon_run(p, PON_SEQ_RX_HOLD);
++	msleep(RX_SETTLE_MS);
++	pon_tx(p, true);
++}
++
++/*
++ * The transmitter is off for the whole reset and on after it, every time,
++ * unless the MAC has turned it off.
++ */
++static void pon_serdes_reset(struct en7581_pon *p)
++{
++	pon_tx(p, false);
++	if (p->xgs) {
++		pon_wr(p, lb(p, LX_RUN_REG), LX_RUN_HOLD);
++		fsleep(1000);
++		pon_light_back(p);
++		fsleep(1000);
++		pon_wr(p, lb(p, LX_RUN_REG), LX_RUN_GO);
++		fsleep(1000);
++		pon_bit(p, lb(p, LX_RX_REG), LX_RX_ON, true);
++	} else {
++		pon_bit(p, lb(p, LG_RX_CLK_REG), LG_RX_CLK_HOLD, true);
++		pon_bit(p, lb(p, LG_PMA_REG), LG_PMA_OK, false);
++		pon_light_back(p);
++		pon_bit(p, lb(p, LG_RX_CLK_REG), LG_RX_CLK_HOLD, false);
++		pon_bit(p, lb(p, LG_PMA_REG), LG_PMA_OK, true);
++	}
++	pon_tx(p, true);
++}
++
++/* Light is there but sync is not: set the serdes up again from scratch. */
++static void pon_start_over(struct en7581_pon *p)
++{
++	pon_run(p, PON_SEQ_RX_HOLD);
++	if (p->xgs)
++		pon_bit(p, lb(p, LX_RX_REG), LX_RX_ON, false);
++	pon_serdes_setup(p);
++	pon_run(p, PON_SEQ_TX_TAPS);
++	p->full_rx_due = true;
++	pon_serdes_reset(p);
++}
++
++static void pon_events_on(struct en7581_pon *p)
++{
++	if (p->xgs)
++		pon_wr(p, lb(p, LX_EVENT_MASK_REG), LX_EVENTS_ON);
++	else
++		pon_wr(p, lb(p, LG_EVENT_MASK_REG), LG_EVENTS_ON);
++}
++
++static void pon_clear_latched(struct en7581_pon *p)
++{
++	pon_ack(p, sd(p, PMA_EVENTS_REG));
++	if (p->xgs)
++		pon_ack(p, lb(p, LX_EVENTS_REG));
++}
++
++static void pon_restart_counters(struct en7581_pon *p, unsigned int groups)
++{
++	if (p->xgs) {
++		/* XGS-PON restarts all of them together. */
++		pon_bit(p, lb(p, LX_CTRL_REG), LX_CNT_RESTART, true);
++		pon_bit(p, lb(p, LX_CTRL_REG), LX_CNT_RESTART, false);
++		return;
++	}
++	if (groups & EN7581_PON_CNT_FEC)
++		pon_wr(p, lb(p, LG_CNT_CMD_REG), LG_CNT_FEC_RESTART);
++	if (groups & EN7581_PON_CNT_BIP)
++		pon_wr(p, lb(p, LG_CNT_CMD_REG), LG_CNT_BIP_RESTART);
++	if (groups & EN7581_PON_CNT_FRAMES)
++		pon_wr(p, lb(p, LG_CNT_CMD_REG), LG_CNT_FRAMES_RESTART);
++}
++
++/* Everything from the optic settings to the counter restart. */
++static int pon_program_all(struct en7581_pon *p)
++{
++	bool light;
++	int err;
++
++	if (p->xgs)
++		pon_wr(p, lb(p, LX_SD_LEVEL_REG), OPTIC_LX_SD_LEVEL);
++	else
++		pon_wr(p, lb(p, LG_OPTIC_REG), OPTIC_LG_LINE);
++	pon_wr(p, sd(p, PMA_OPTIC_A_REG), OPTIC_PMA_A);
++	pon_wr(p, sd(p, PMA_OPTIC_B_REG), OPTIC_PMA_B);
++
++	pon_serdes_setup(p);
++
++	/* The receiver is brought up whether or not there is light. */
++	light = pon_light(p);
++	pon_rx_bringup(p);
++	if (!light) {
++		fsleep(1000);
++		pon_run(p, PON_SEQ_RX_HOLD);
++		fsleep(1000);
++		p->full_rx_due = true;
++		p->rx_done = false;
++	} else {
++		p->full_rx_due = false;
++		p->rx_done = true;
++		msleep(RX_SETTLE_MS);
++	}
++
++	pon_run(p, PON_SEQ_TX_TAPS);
++
++	err = regmap_write_bits(p->scu, SCU_BUS_REG, SCU_BUS_OK, 0);
++	if (err)
++		return err;
++	err = regmap_write_bits(p->scu, SCU_TX_PIN_REG, SCU_TX_PIN, 0);
++	if (err)
++		return err;
++
++	if (p->xgs) {
++		pon_bit(p, lb(p, LX_RX_REG), LX_RX_ON, true);
++	} else {
++		pon_bit(p, lb(p, LG_FRAMING_REG), LG_GPON_ON, true);
++		pon_bit(p, lb(p, LG_PMA_REG), LG_PMA_OK, false);
++	}
++
++	pon_events_on(p);
++
++	if (!p->xgs) {
++		pon_bit(p, lb(p, LG_CNT_EN_REG), LG_CNT_EN_FEC, true);
++		pon_bit(p, lb(p, LG_CNT_EN_REG), LG_CNT_EN_BIP, true);
++		pon_bit(p, lb(p, LG_CNT_EN_REG), LG_CNT_EN_FRAMES, true);
++	}
++
++	pon_restart_counters(p, EN7581_PON_CNT_ALL);
++	return 0;
++}
++
++static int pon_pulse_reset(struct en7581_pon *p)
++{
++	int err;
++
++	err = reset_control_assert(p->rst);
++	if (err)
++		return err;
++	udelay(1);
++	return reset_control_deassert(p->rst);
++}
++
++/* Arm the next poll @ms from now, replacing a pending one. */
++static void pon_arm_now(struct en7581_pon *p, unsigned int ms)
++{
++	mod_delayed_work(system_long_wq, &p->poll, msecs_to_jiffies(ms));
++}
++
++/*
++ * Reset and reprogram the whole PHY; called with @lock held and the poll
++ * dropped. It ends with the PHY powered, whatever it found, and the
++ * transmitter on, in the dark too. On an error the programming is lost: the
++ * PHY is left unprogrammed and powered off, the transmitter off, until the
++ * MAC selects the mode again.
++ */
++static int pon_whole_reset(struct en7581_pon *p)
++{
++	int err;
++
++	pon_tx(p, false);
++	if (p->xgs)
++		pon_wr(p, lb(p, LX_EVENT_MASK_REG), 0);
++	else
++		pon_wr(p, lb(p, LG_EVENT_MASK_REG), 0);
++
++	err = pon_pulse_reset(p);
++	if (err)
++		goto lost;
++
++	if (p->xgs) {
++		pon_wr(p, lb(p, LX_RUN_REG), LX_RUN_HOLD);
++		udelay(1);
++		pon_wr(p, lb(p, LX_RUN_REG), LX_RUN_GO);
++	}
++
++	err = pon_program_all(p);
++	if (err)
++		goto lost;
++	pon_clear_latched(p);
++
++	/* Powered off, the reset powers the PHY on as a power-on would. */
++	if (p->powered) {
++		pon_events_on(p);
++	} else {
++		p->light_seen = false;
++		WRITE_ONCE(p->powered, true);
++	}
++	p->link = PON_LINK_UNKNOWN;
++	p->stray_event = false;
++	pon_arm_now(p, p->poll_ms);
++	pon_tx(p, true);
++	return 0;
++
++lost:
++	p->programmed = false;
++	WRITE_ONCE(p->powered, false);
++	p->link = PON_LINK_UNKNOWN;
++	return err;
++}
++
++/* The poll */
++
++/*
++ * Arm the next poll @ms from the end of this pass. A later arming in the same
++ * pass replaces an earlier one.
++ */
++static void pon_arm(struct en7581_pon *p, unsigned int ms)
++{
++	p->next_poll = ms;
++}
++
++/*
++ * Tell the MAC about the link. @polled marks a report the mode poll makes for
++ * itself; the event passes' reports, and the lost one XGS-PON sends ahead of
++ * a ready after a stray event, are not.
++ */
++static void pon_report(struct en7581_pon *p,
++		       enum en7581_pon_link_report report, bool polled)
++{
++	if (p->link_fn)
++		p->link_fn(p->link_data, report, polled);
++}
++
++static void pon_gpon_dark(struct en7581_pon *p)
++{
++	pon_bit(p, lb(p, LG_PMA_REG), LG_PMA_OK, false);
++	pon_run(p, PON_SEQ_RX_HOLD);
++}
++
++static void pon_events_gpon(struct en7581_pon *p, u32 ev)
++{
++	if (p->light_seen) {
++		if (p->link != PON_LINK_READY && (ev & LG_EV_SYNC)) {
++			p->link = PON_LINK_READY;
++			pon_report(p, EN7581_PON_REPORT_READY, false);
++			p->light_seen = false;
++		} else if (ev & LG_EV_LIGHT_LOST) {
++			if (p->link == PON_LINK_READY) {
++				p->link = PON_LINK_LOST;
++				pon_report(p, EN7581_PON_REPORT_LOST, false);
++			}
++			p->light_seen = false;
++			pon_gpon_dark(p);
++		}
++	} else if (p->link == PON_LINK_READY && (ev & LG_EV_LIGHT_LOST)) {
++		p->link = PON_LINK_LOST;
++		pon_report(p, EN7581_PON_REPORT_LOST, false);
++		pon_gpon_dark(p);
++	} else if (p->link != PON_LINK_READY && (ev & LG_EV_LIGHT_BACK)) {
++		pon_serdes_reset(p);
++		p->light_seen = true;
++	}
++	pon_arm(p, p->poll_ms);
++}
++
++static void pon_xgs_dark(struct en7581_pon *p)
++{
++	pon_run(p, PON_SEQ_RX_HOLD);
++	pon_bit(p, lb(p, LX_RX_REG), LX_RX_ON, false);
++}
++
++static void pon_events_xgs(struct en7581_pon *p, u32 ev)
++{
++	p->poll_ms = POLL_MS;
++
++	if (p->link != PON_LINK_LOST && (ev & LX_EV_LIGHT_LOST)) {
++		p->stray_event = false;
++		pon_xgs_dark(p);
++		p->link = PON_LINK_LOST;
++		pon_report(p, EN7581_PON_REPORT_LOST, false);
++	} else if (p->link != PON_LINK_READY && (ev & LX_EV_RX_READY)) {
++		fsleep(2000);
++		pon_serdes_reset(p);
++		fsleep(8000);
++		/* Look again soon, and do not act on what that look misses. */
++		p->poll_ms = POLL_QUICK_MS;
++	} else if (p->link != PON_LINK_READY && (ev & LX_EV_SYNC)) {
++		if (!pon_light(p)) {
++			pon_xgs_dark(p);
++			p->link = PON_LINK_LOST;
++			pon_report(p, EN7581_PON_REPORT_LOST, false);
++		} else if (pon_ready(p)) {
++			p->link = PON_LINK_READY;
++			pon_report(p, EN7581_PON_REPORT_READY, false);
++		} else {
++			p->link = PON_LINK_UNKNOWN;
++		}
++	} else if (ev & LX_EV_FRAME_LOST) {
++		p->link = PON_LINK_UNKNOWN;
++		pon_report(p, EN7581_PON_REPORT_FRAME_LOST, false);
++		if ((ev & LX_EV_SYNC) && pon_ready(p)) {
++			p->link = PON_LINK_READY;
++			pon_report(p, EN7581_PON_REPORT_READY, false);
++		}
++	} else {
++		p->stray_event = true;
++		p->link = PON_LINK_UNKNOWN;
++	}
++	pon_arm(p, p->poll_ms);
++}
++
++/*
++ * Handle the latched link events, if any; returns whether there were. Only
++ * the bits the event mask enables count, as only they raise the PHY
++ * interrupt; a bit outside it stays latched until a pass writes it back with
++ * the rest.
++ */
++static bool pon_service_events(struct en7581_pon *p)
++{
++	u32 ev;
++
++	if (p->xgs) {
++		ev = readl(lb(p, LX_EVENTS_REG));
++		if (!(ev & LX_EVENTS_ON))
++			return false;
++		pon_wr(p, lb(p, LX_EVENTS_REG), ev);
++		pon_events_xgs(p, ev);
++	} else {
++		ev = readl(lb(p, LG_EVENTS_REG));
++		if (!(ev & LG_EVENTS_ON))
++			return false;
++		pon_wr(p, lb(p, LG_EVENT_CLR_REG), ev);
++		pon_events_gpon(p, ev);
++	}
++	return true;
++}
++
++/*
++ * GPON reports on every poll, from the one reading it takes at the start,
++ * after any start-over. Light without sync starts over every time.
++ */
++static void pon_poll_gpon(struct en7581_pon *p)
++{
++	bool ready, light;
++
++	p->poll_ms = POLL_MS;
++	ready = pon_ready(p);
++	light = pon_light(p);
++
++	if (p->link == PON_LINK_READY) {
++		if (ready && light) {
++			pon_report(p, EN7581_PON_REPORT_READY, true);
++		} else {
++			p->link = PON_LINK_LOST;
++			pon_report(p, EN7581_PON_REPORT_LOST, true);
++		}
++		return;
++	}
++
++	if (!ready && light) {
++		pon_start_over(p);
++		pon_arm(p, POLL_MISS_MS);
++	}
++
++	if (ready && light) {
++		p->link = PON_LINK_READY;
++		pon_report(p, EN7581_PON_REPORT_READY, true);
++	} else {
++		p->link = PON_LINK_LOST;
++		pon_report(p, EN7581_PON_REPORT_LOST, true);
++	}
++}
++
++/* XGS-PON reports only when the link changes. */
++static void pon_poll_xgs(struct en7581_pon *p)
++{
++	bool ready, light;
++
++	ready = pon_ready(p);
++	light = pon_light(p);
++
++	if (p->link == PON_LINK_READY) {
++		if (ready && light)
++			return;
++		pon_arm(p, p->poll_ms);
++		p->link = PON_LINK_LOST;
++		p->stray_event = false;
++		pon_report(p, EN7581_PON_REPORT_LOST, true);
++		return;
++	}
++
++	if (!ready && light) {
++		/* The quick look after receiver-ready does not start over. */
++		if (p->poll_ms > POLL_ACT_MIN_MS)
++			pon_start_over(p);
++		pon_arm(p, POLL_MISS_MS);
++		p->poll_ms = POLL_MS;
++		return;
++	}
++
++	if (ready && light) {
++		if (p->stray_event) {
++			p->stray_event = false;
++			p->link = PON_LINK_LOST;
++			pon_report(p, EN7581_PON_REPORT_LOST, false);
++		}
++		p->link = PON_LINK_READY;
++		pon_report(p, EN7581_PON_REPORT_READY, true);
++		return;
++	}
++
++	if (p->link == PON_LINK_UNKNOWN) {
++		pon_report(p, EN7581_PON_REPORT_LOST, true);
++		pon_xgs_dark(p);
++	}
++	p->link = PON_LINK_LOST;
++	p->stray_event = false;
++}
++
++/*
++ * The hardware latches link events, but the PHY's interrupt line is not
++ * used: each poll looks for them first, and so does the watch while the MAC
++ * has it on (pon_watch_work()). A poll that finds some handles them
++ * and ends there, so the receiver gets the time that handling armed before
++ * the mode poll judges the link; only a poll that finds none runs the mode
++ * poll, and only such a poll ends with the end rule (poll_ms back to
++ * POLL_MS). A poll that comes due after power-off applies the end rule alone
++ * and stops there.
++ */
++static void pon_poll_work(struct work_struct *work)
++{
++	struct en7581_pon *p = container_of(to_delayed_work(work),
++					    struct en7581_pon, poll);
++	bool mode_poll = true;
++
++	mutex_lock(&p->lock);
++	p->next_poll = 0;
++	if (p->powered) {
++		mode_poll = !pon_service_events(p);
++		if (mode_poll && p->xgs)
++			pon_poll_xgs(p);
++		else if (mode_poll)
++			pon_poll_gpon(p);
++		/* Nothing armed: keep looking for events. */
++		if (!p->next_poll)
++			p->next_poll = POLL_MS;
++	}
++
++	if (mode_poll && p->poll_ms < POLL_MS) {
++		p->poll_ms = POLL_MS;
++		pon_arm(p, POLL_MS);
++	}
++
++	if (p->next_poll)
++		pon_arm_now(p, p->next_poll);
++	mutex_unlock(&p->lock);
++}
++
++/*
++ * The watch: an event pass every WATCH_MS while the MAC wants link events
++ * sooner than the poll finds them, as an interrupt handler would run it.
++ * Only a pass that finds latched events does anything: it handles them and
++ * arms the poll at what that handling armed, replacing the pending poll, and
++ * never applies the end rule. The mode poll stays the poll's alone, so the
++ * receiver still gets the time the handling armed before the link is judged.
++ * This polling watch does not need an interrupt-storm counter.
++ */
++static void pon_watch_work(struct work_struct *work)
++{
++	struct en7581_pon *p = container_of(to_delayed_work(work),
++					    struct en7581_pon, watch);
++
++	mutex_lock(&p->lock);
++	if (p->powered) {
++		p->next_poll = 0;
++		if (pon_service_events(p) && p->next_poll)
++			pon_arm_now(p, p->next_poll);
++	}
++	if (READ_ONCE(p->watching))
++		mod_delayed_work(system_long_wq, &p->watch,
++				 msecs_to_jiffies(WATCH_MS));
++	mutex_unlock(&p->lock);
++}
++
++/* Generic PHY operations */
++
++/* A pulse or hold of the reset line loses the programming. */
++static void pon_unprogram(struct en7581_pon *p)
++{
++	mutex_lock(&p->lock);
++	p->programmed = false;
++	mutex_unlock(&p->lock);
++}
++
++/* Init forgets the previous MAC's transmitter call; the line stays as it is. */
++static int en7581_pon_init(struct phy *phy)
++{
++	struct en7581_pon *p = phy_get_drvdata(phy);
++	unsigned long flags;
++
++	spin_lock_irqsave(&p->tx_lock, flags);
++	p->tx_allowed = true;
++	p->tx_held = false;
++	spin_unlock_irqrestore(&p->tx_lock, flags);
++	pon_unprogram(p);
++	return pon_pulse_reset(p);
++}
++
++/*
++ * Exit disables the PHY: the transmitter off first, then the PHY's
++ * state back to its values at load, so the next init starts as a load does;
++ * the reset line is held. A poll still pending finds the PHY powered off and
++ * touches nothing. The test modes are not undone one by one: the transmitter
++ * is off and the PHY held in reset.
++ */
++static int en7581_pon_exit(struct phy *phy)
++{
++	struct en7581_pon *p = phy_get_drvdata(phy);
++
++	pon_tx(p, false);
++	WRITE_ONCE(p->watching, false);
++	mutex_lock(&p->lock);
++	p->programmed = false;
++	WRITE_ONCE(p->powered, false);
++	p->link = PON_LINK_UNKNOWN;
++	p->poll_ms = POLL_MS;
++	p->stray_event = false;
++	mutex_unlock(&p->lock);
++	return reset_control_assert(p->rst);
++}
++
++/*
++ * The first mode selection after init selects the line and programs the PHY
++ * (power-on steps 1 to 9), after putting back the serdes bits only the other
++ * line writes when that line was the one programmed before; the PHY stays
++ * programmed until exit or the next init, and a later selection programs
++ * nothing. Every GPON selection ends in
++ * the dark bring-up (step 10) while rx_done is clear, so one after a
++ * whole-PHY reset in the dark runs it again. Every selection, powered or not,
++ * turns the transmitter on once rx_done is set (unless the MAC turned it off),
++ * before that bring-up, so a PHY programmed in the dark keeps it off until its
++ * first serdes reset or the next selection.
++ */
++static int en7581_pon_set_mode(struct phy *phy, enum phy_mode mode,
++			       int submode)
++{
++	struct en7581_pon *p = phy_get_drvdata(phy);
++	bool xgs;
++	int err;
++
++	if (mode != PHY_MODE_ETHERNET)
++		return -EINVAL;
++	if (submode == EN7581_PON_GPON)
++		xgs = false;
++	else if (submode == EN7581_PON_XGSPON)
++		xgs = true;
++	else
++		return -EINVAL;
++
++	mutex_lock(&p->lock);
++	if (p->programmed) {
++		if (p->rx_done)
++			pon_tx(p, true);
++		pon_gpon_dark_bringup(p);
++		err = 0;
++		goto out;
++	}
++	/* The serdes still holds the other line's own bits; @xgs names it. */
++	if (p->line_set && p->xgs != xgs)
++		pon_run(p, PON_SEQ_LINE_LEAVE);
++	err = regmap_write_bits(p->scu, SCU_LINE_SEL_REG, SCU_LINE_SEL,
++				xgs ? SCU_LINE_XGSPON : SCU_LINE_GPON);
++	if (err)
++		goto out;
++	p->xgs = xgs;
++	p->line_set = true;
++
++	err = pon_program_all(p);
++	if (err)
++		goto out;
++	if (p->rx_done)
++		pon_tx(p, true);
++	pon_gpon_dark_bringup(p);
++	p->programmed = true;
++out:
++	mutex_unlock(&p->lock);
++	return err;
++}
++
++/* The PHY is already programmed; powering it on starts the link watch. */
++static int en7581_pon_power_on(struct phy *phy)
++{
++	struct en7581_pon *p = phy_get_drvdata(phy);
++	int err = 0;
++
++	mutex_lock(&p->lock);
++	if (!p->programmed) {
++		dev_err(p->dev, "no line mode selected\n");
++		err = -EINVAL;
++		goto out;
++	}
++	if (p->powered)
++		goto out;
++
++	pon_clear_latched(p);
++	p->link = PON_LINK_UNKNOWN;
++	p->light_seen = false;
++	WRITE_ONCE(p->powered, true);
++	pon_arm_now(p, p->poll_ms);
++out:
++	mutex_unlock(&p->lock);
++	return err;
++}
++
++/*
++ * Nothing is written, the transmitter is left as it is, and the PHY keeps
++ * running as programmed. A poll still pending comes due and only puts poll_ms
++ * back (pon_poll_work()).
++ */
++static int en7581_pon_power_off(struct phy *phy)
++{
++	struct en7581_pon *p = phy_get_drvdata(phy);
++
++	mutex_lock(&p->lock);
++	WRITE_ONCE(p->powered, false);
++	p->link = PON_LINK_UNKNOWN;
++	mutex_unlock(&p->lock);
++	return 0;
++}
++
++/*
++ * Reset and reprogram the whole PHY; it is powered on afterwards, one powered
++ * off included. The generic PHY core's power
++ * count does not see that power-on: a MAC that resets a PHY it has powered
++ * off powers it on through the core before it powers it off again. No MAC
++ * does today.
++ */
++static int en7581_pon_reset(struct phy *phy)
++{
++	struct en7581_pon *p = phy_get_drvdata(phy);
++	int err;
++
++	cancel_delayed_work_sync(&p->poll);
++	mutex_lock(&p->lock);
++	err = p->programmed ? pon_whole_reset(p) : -EINVAL;
++	mutex_unlock(&p->lock);
++	return err;
++}
++
++static const struct phy_ops en7581_pon_ops = {
++	.init		= en7581_pon_init,
++	.exit		= en7581_pon_exit,
++	.power_on	= en7581_pon_power_on,
++	.power_off	= en7581_pon_power_off,
++	.set_mode	= en7581_pon_set_mode,
++	.reset		= en7581_pon_reset,
++	.owner		= THIS_MODULE,
++};
++
++/* Operations for the PON MAC */
++
++static struct en7581_pon *pon_of(struct phy *phy)
++{
++	if (IS_ERR_OR_NULL(phy) || phy->ops != &en7581_pon_ops)
++		return NULL;
++	return phy_get_drvdata(phy);
++}
++
++static int pon_get(struct phy *phy, struct en7581_pon **out)
++{
++	struct en7581_pon *p = pon_of(phy);
++
++	if (!p)
++		return -EINVAL;
++	if (!READ_ONCE(p->powered))
++		return -ENODEV;
++	*out = p;
++	return 0;
++}
++
++/**
++ * en7581_pon_phy_set_link_handler() - receive the PHY's link reports
++ * @phy: the PON PHY
++ * @fn: called on every report, or NULL to stop
++ * @data: passed to @fn
++ *
++ * Sleeps. Need not be powered on.
++ *
++ * Return: 0, or -EINVAL if @phy is not an EN7581 PON PHY.
++ */
++int en7581_pon_phy_set_link_handler(struct phy *phy, en7581_pon_link_fn fn,
++				    void *data)
++{
++	struct en7581_pon *p = pon_of(phy);
++
++	if (!p)
++		return -EINVAL;
++	mutex_lock(&p->lock);
++	p->link_fn = fn;
++	p->link_data = data;
++	mutex_unlock(&p->lock);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_link_handler);
++
++/**
++ * en7581_pon_phy_watch_events() - handle link events within milliseconds
++ * @phy: the PON PHY
++ * @on: start or stop watching
++ *
++ * Without the interrupt line, a latched link event is handled at the next
++ * poll, which with nothing armed comes 1.5 s later. While watching, the PHY
++ * also looks for latched events every 10 ms and handles them as its interrupt
++ * would: the reports they lead to go to the MAC at once, and the poll comes
++ * when that handling arms it. For a MAC timer shorter than the poll, such as
++ * XGS-PON's TO2. Exit stops it. Need not be powered on.
++ *
++ * Return: 0, or -EINVAL if @phy is not an EN7581 PON PHY.
++ */
++int en7581_pon_phy_watch_events(struct phy *phy, bool on)
++{
++	struct en7581_pon *p = pon_of(phy);
++
++	if (!p)
++		return -EINVAL;
++	WRITE_ONCE(p->watching, on);
++	if (on)
++		mod_delayed_work(system_long_wq, &p->watch,
++				 msecs_to_jiffies(WATCH_MS));
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_watch_events);
++
++/**
++ * en7581_pon_phy_link() - read the downstream link now
++ * @phy: the PON PHY
++ * @ready: set when the downstream is synchronised
++ * @light: set when the optical module reports light
++ *
++ * A PHY that is powered off reports neither.
++ *
++ * Return: 0, or -EINVAL if @phy is not an EN7581 PON PHY.
++ */
++int en7581_pon_phy_link(struct phy *phy, bool *ready, bool *light)
++{
++	struct en7581_pon *p = pon_of(phy);
++
++	if (!p)
++		return -EINVAL;
++	if (!READ_ONCE(p->powered)) {
++		*ready = false;
++		*light = false;
++		return 0;
++	}
++	*ready = pon_ready(p);
++	*light = pon_light(p);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_link);
++
++/**
++ * en7581_pon_phy_restart_counters() - restart the error and frame counters
++ * @phy: the PON PHY
++ * @groups: EN7581_PON_CNT_* bits
++ *
++ * XGS-PON restarts every counter whatever @groups asks.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_restart_counters(struct phy *phy, unsigned int groups)
++{
++	struct en7581_pon *p;
++	int err;
++
++	if (groups & ~EN7581_PON_CNT_ALL)
++		return -EINVAL;
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	pon_restart_counters(p, groups);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_restart_counters);
++
++/**
++ * en7581_pon_phy_bip_errors() - read and restart the GPON BIP-8 error count
++ * @phy: the PON PHY
++ * @errors: the errors since the previous call
++ *
++ * XGS-PON has no BIP count and answers 0.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_bip_errors(struct phy *phy, u32 *errors)
++{
++	unsigned long flags;
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (p->xgs) {
++		*errors = 0;
++		return 0;
++	}
++	spin_lock_irqsave(&p->reg_lock, flags);
++	writel(LG_CNT_BIP_LATCH, lb(p, LG_CNT_CMD_REG));
++	*errors = readl(lb(p, LG_BIP_REG));
++	writel(LG_CNT_BIP_RESTART, lb(p, LG_CNT_CMD_REG));
++	spin_unlock_irqrestore(&p->reg_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_bip_errors);
++
++/**
++ * en7581_pon_phy_fec_stats() - read the downstream FEC counters
++ * @phy: the PON PHY
++ * @st: the counters
++ *
++ * The counters keep running; en7581_pon_phy_restart_counters() restarts them.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_fec_stats(struct phy *phy, struct en7581_pon_fec_stats *st)
++{
++	unsigned long flags;
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (p->xgs) {
++		st->corrected_bytes = readl(lb(p, LX_FEC_BYTES_REG));
++		st->corrected_words = readl(lb(p, LX_FEC_FIXED_REG));
++		st->uncorrectable_words = readl(lb(p, LX_FEC_LOST_REG));
++		st->total_words = readl(lb(p, LX_FEC_TOTAL_REG));
++		st->errored_seconds = readl(lb(p, LX_FEC_SECS_REG));
++		return 0;
++	}
++	spin_lock_irqsave(&p->reg_lock, flags);
++	writel(LG_CNT_FEC_LATCH, lb(p, LG_CNT_CMD_REG));
++	st->corrected_bytes = readl(lb(p, LG_FEC_BYTES_REG));
++	st->corrected_words = readl(lb(p, LG_FEC_FIXED_REG));
++	st->uncorrectable_words = readl(lb(p, LG_FEC_LOST_REG));
++	st->total_words = readl(lb(p, LG_FEC_TOTAL_REG));
++	st->errored_seconds = readl(lb(p, LG_FEC_SECS_REG));
++	spin_unlock_irqrestore(&p->reg_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_fec_stats);
++
++/**
++ * en7581_pon_phy_frame_stats() - read the downstream frame counters
++ * @phy: the PON PHY
++ * @st: the counters
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_frame_stats(struct phy *phy,
++			       struct en7581_pon_frame_stats *st)
++{
++	unsigned long flags;
++	struct en7581_pon *p;
++	u32 hi, lo;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (p->xgs) {
++		st->frames = readl(lb(p, LX_FRAMES_REG));
++		st->lof = readl(lb(p, LX_LOF_REG));
++		return 0;
++	}
++	spin_lock_irqsave(&p->reg_lock, flags);
++	writel(LG_CNT_FRAMES_LATCH, lb(p, LG_CNT_CMD_REG));
++	hi = readl(lb(p, LG_FRAMES_HI_REG));
++	lo = readl(lb(p, LG_FRAMES_LO_REG));
++	/* The loss-of-frame count only runs with GPON framing on. */
++	if (readl(lb(p, LG_FRAMING_REG)) & LG_GPON_ON)
++		st->lof = readl(lb(p, LG_LOF_REG));
++	else
++		st->lof = 0;
++	spin_unlock_irqrestore(&p->reg_lock, flags);
++	st->frames = (u64)hi << 32 | lo;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_frame_stats);
++
++/**
++ * en7581_pon_phy_fec_in_use() - whether the line carries FEC
++ * @phy: the PON PHY
++ * @down: set when the downstream frames carry FEC
++ * @up: set when the upstream bursts carry FEC
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_fec_in_use(struct phy *phy, bool *down, bool *up)
++{
++	unsigned long flags;
++	struct en7581_pon *p;
++	u32 sel;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (!p->xgs) {
++		*down = readl(lb(p, LG_RX_FEC_REG)) & LG_RX_FEC_SEEN;
++		*up = readl(lb(p, LG_TX_FEC_REG)) & LG_TX_FEC_SEEN;
++		return 0;
++	}
++	/* The downstream state is behind a probe select; restore it after. */
++	spin_lock_irqsave(&p->reg_lock, flags);
++	sel = readl(lb(p, LX_PROBE_SEL_REG));
++	writel((sel & ~LX_PROBE_SEL) |
++	       FIELD_PREP(LX_PROBE_SEL, LX_PROBE_SEL_FEC),
++	       lb(p, LX_PROBE_SEL_REG));
++	*down = readl(lb(p, LX_PROBE_REG)) & LX_PROBE_RX_FEC;
++	writel(sel, lb(p, LX_PROBE_SEL_REG));
++	spin_unlock_irqrestore(&p->reg_lock, flags);
++	*up = readl(lb(p, LX_TX_FEC_REG)) & LX_TX_FEC_SEEN;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_fec_in_use);
++
++/**
++ * en7581_pon_phy_get_fec_decode() - whether downstream FEC decoding is on
++ * @phy: the PON PHY
++ * @on: set when it is
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_get_fec_decode(struct phy *phy, bool *on)
++{
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (p->xgs)
++		*on = readl(lb(p, LX_CTRL_REG)) & LX_FEC_DEC_ON;
++	else
++		*on = readl(lb(p, LG_FEC_DECODE_REG)) != 0;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_get_fec_decode);
++
++/**
++ * en7581_pon_phy_set_fec_decode() - set downstream FEC decoding
++ * @phy: the PON PHY
++ * @mode: off, on, or following the OLT (XGS-PON only)
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_set_fec_decode(struct phy *phy,
++				  enum en7581_pon_fec_decode mode)
++{
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (!p->xgs) {
++		if (mode == EN7581_PON_FEC_DECODE_AUTO)
++			return -EOPNOTSUPP;
++		if (mode != EN7581_PON_FEC_DECODE_OFF &&
++		    mode != EN7581_PON_FEC_DECODE_ON)
++			return -EINVAL;
++		pon_wr(p, lb(p, LG_FEC_DECODE_REG),
++		       mode == EN7581_PON_FEC_DECODE_ON);
++		return 0;
++	}
++	switch (mode) {
++	case EN7581_PON_FEC_DECODE_OFF:
++		pon_rmw(p, lb(p, LX_CTRL_REG), LX_FEC_DEC_ALL, 0);
++		break;
++	case EN7581_PON_FEC_DECODE_ON:
++		pon_rmw(p, lb(p, LX_CTRL_REG), LX_FEC_DEC_ON | LX_FEC_DEC_AUTO,
++			LX_FEC_DEC_ON);
++		break;
++	case EN7581_PON_FEC_DECODE_AUTO:
++		pon_rmw(p, lb(p, LX_CTRL_REG), LX_FEC_DEC_ON | LX_FEC_DEC_AUTO,
++			LX_FEC_DEC_ON | LX_FEC_DEC_AUTO);
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_fec_decode);
++
++/**
++ * en7581_pon_phy_rtt() - the round-trip delay the GPON line block measured
++ * @phy: the PON PHY
++ * @rtt: the delay
++ *
++ * XGS-PON has none and answers 0.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_rtt(struct phy *phy, u32 *rtt)
++{
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (p->xgs) {
++		*rtt = 0;
++		return 0;
++	}
++	*rtt = FIELD_GET(LG_RTT, readl(lb(p, LG_RTT_REG)));
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_rtt);
++
++/**
++ * en7581_pon_phy_set_gpon_overhead() - set the GPON upstream burst overhead
++ * @phy: the PON PHY
++ * @oh: the overhead, as the Upstream_Overhead message gives it
++ *
++ * XGS-PON has no such setting; nothing happens.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_set_gpon_overhead(struct phy *phy,
++				     const struct en7581_pon_gpon_overhead *oh)
++{
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (p->xgs)
++		return 0;
++	pon_wr(p, lb(p, LG_OVERHEAD_REG),
++	       FIELD_PREP(LG_OH_GUARD, oh->guard_time) |
++	       FIELD_PREP(LG_OH_TYPE2, oh->type2_bits) |
++	       FIELD_PREP(LG_OH_TYPE1, oh->type1_bits) |
++	       FIELD_PREP(LG_OH_TYPE3, oh->type3_pattern));
++	pon_wr(p, lb(p, LG_DELIM_REG),
++	       FIELD_PREP(LG_DELIM_FILL, LG_DELIM_FILL_BYTE) |
++	       oh->delimiter[0] << 16 | oh->delimiter[1] << 8 |
++	       oh->delimiter[2]);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_gpon_overhead);
++
++/**
++ * en7581_pon_phy_set_onu_state() - tell the GPON burst logic the ONU state
++ * @phy: the PON PHY
++ * @state: standby, ranging or operation
++ *
++ * Entering standby also clears the extended burst settings. XGS-PON has no
++ * such setting; nothing happens.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_set_onu_state(struct phy *phy,
++				 enum en7581_pon_onu_state state)
++{
++	void __iomem *reg;
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (p->xgs)
++		return 0;
++	reg = lb(p, LG_BURST_REG);
++	switch (state) {
++	case EN7581_PON_ONU_STANDBY:
++		pon_rmw(p, reg, LG_BURST_ALL, 0);
++		break;
++	case EN7581_PON_ONU_RANGING:
++		pon_field(p, reg, LG_BURST_STATE, LG_STATE_RANGING);
++		break;
++	case EN7581_PON_ONU_OPERATION:
++		pon_field(p, reg, LG_BURST_STATE, LG_STATE_OPERATION);
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_onu_state);
++
++/**
++ * en7581_pon_phy_set_extended_burst() - GPON extended burst lengths
++ * @phy: the PON PHY
++ * @ranging_bytes: type 3 preamble bytes while ranging
++ * @operation_bytes: type 3 preamble bytes in operation
++ *
++ * The values of the Extended_Burst_Length message (ITU-T G.984.3). This also
++ * puts the burst logic in the ranging state. XGS-PON has no such setting;
++ * nothing happens.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_set_extended_burst(struct phy *phy, u8 ranging_bytes,
++				      u8 operation_bytes)
++{
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (p->xgs)
++		return 0;
++	pon_rmw(p, lb(p, LG_BURST_REG), LG_BURST_ALL,
++		FIELD_PREP(LG_BURST_RANGING, ranging_bytes) |
++		FIELD_PREP(LG_BURST_OPERATION, operation_bytes) |
++		LG_BURST_EXT_ON |
++		FIELD_PREP(LG_BURST_STATE, LG_STATE_RANGING));
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_extended_burst);
++
++/**
++ * en7581_pon_phy_set_bit_delay() - GPON upstream delay below one byte
++ * @phy: the PON PHY
++ * @bits: 0 to 7
++ *
++ * The part of the equalisation delay the MAC cannot apply in whole bytes,
++ * written into the line block's delay field as is, with its enable bit set.
++ * A value above 7 is ignored, and so is the call in XGS-PON, which has no
++ * such setting.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_set_bit_delay(struct phy *phy, unsigned int bits)
++{
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (p->xgs || bits > 7)
++		return 0;
++	pon_rmw(p, lb(p, LG_DELAY_REG), LG_BIT_DELAY | LG_BIT_DELAY_ON,
++		FIELD_PREP(LG_BIT_DELAY, bits) | LG_BIT_DELAY_ON);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_bit_delay);
++
++/**
++ * en7581_pon_phy_set_serdes_usable() - the GPON serdes-usable handshake
++ * @phy: the PON PHY
++ * @usable: whether the GPON framer may use the serdes
++ *
++ * The MAC clears this around its own resets and sets it after. The hardware
++ * never sets it itself. XGS-PON has no such handshake; nothing happens.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_set_serdes_usable(struct phy *phy, bool usable)
++{
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (!p->xgs)
++		pon_bit(p, lb(p, LG_PMA_REG), LG_PMA_OK, usable);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_serdes_usable);
++
++/**
++ * en7581_pon_phy_logic_reset() - restart the receive path
++ * @phy: the PON PHY
++ *
++ * XGS-PON sets the serdes up again and redoes the receiver bring-up. GPON
++ * does nothing. Sleeps.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_logic_reset(struct phy *phy)
++{
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (!p->xgs)
++		return 0;
++	mutex_lock(&p->lock);
++	if (p->powered)
++		pon_start_over(p);
++	else
++		err = -ENODEV;
++	mutex_unlock(&p->lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_logic_reset);
++
++/**
++ * en7581_pon_phy_set_burst_profile() - set an XGS-PON upstream burst profile
++ * @phy: the PON PHY
++ * @n: the profile, 0 to 3
++ * @bp: the profile, as the Burst_Profile message gives it
++ *
++ * Return: 0, -EOPNOTSUPP in GPON, or another negative error code.
++ */
++int en7581_pon_phy_set_burst_profile(struct phy *phy, unsigned int n,
++				     const struct en7581_pon_burst_profile *bp)
++{
++	unsigned long flags;
++	struct en7581_pon *p;
++	u32 fec;
++	int err;
++
++	if (n >= LX_BURST_PROFILES ||
++	    bp->delimiter_len > FIELD_MAX(LX_SHAPE_DELIM_LEN) ||
++	    bp->preamble_len > FIELD_MAX(LX_SHAPE_PRE_LEN))
++		return -EINVAL;
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (!p->xgs)
++		return -EOPNOTSUPP;
++
++	spin_lock_irqsave(&p->reg_lock, flags);
++	fec = readl(lb(p, LX_BURST_FEC_REG));
++	writel(get_unaligned_be32(&bp->preamble[0]), lb(p, LX_PRE_HI_REG(n)));
++	writel(get_unaligned_be32(&bp->preamble[4]), lb(p, LX_PRE_LO_REG(n)));
++	writel(get_unaligned_be32(&bp->delimiter[0]),
++	       lb(p, LX_DELIM_HI_REG(n)));
++	writel(get_unaligned_be32(&bp->delimiter[4]),
++	       lb(p, LX_DELIM_LO_REG(n)));
++	if (bp->fec)
++		fec |= LX_BURST_FEC(n);
++	else
++		fec &= ~LX_BURST_FEC(n);
++	writel(fec, lb(p, LX_BURST_FEC_REG));
++	writel(FIELD_PREP(LX_SHAPE_DELIM_LEN, bp->delimiter_len) |
++	       FIELD_PREP(LX_SHAPE_PRE_LEN, bp->preamble_len) |
++	       FIELD_PREP(LX_SHAPE_PRE_REPEAT, bp->preamble_repeat),
++	       lb(p, LX_BURST_SHAPE_REG(n)));
++	spin_unlock_irqrestore(&p->reg_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_burst_profile);
++
++/**
++ * en7581_pon_phy_get_burst_profile() - read an XGS-PON burst profile back
++ * @phy: the PON PHY
++ * @n: the profile, 0 to 3
++ * @bp: the profile
++ *
++ * Return: 0, -EOPNOTSUPP in GPON, or another negative error code.
++ */
++int en7581_pon_phy_get_burst_profile(struct phy *phy, unsigned int n,
++				     struct en7581_pon_burst_profile *bp)
++{
++	unsigned long flags;
++	struct en7581_pon *p;
++	u32 shape;
++	int err;
++
++	if (n >= LX_BURST_PROFILES)
++		return -EINVAL;
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (!p->xgs)
++		return -EOPNOTSUPP;
++
++	spin_lock_irqsave(&p->reg_lock, flags);
++	bp->fec = readl(lb(p, LX_BURST_FEC_REG)) & LX_BURST_FEC(n);
++	put_unaligned_be32(readl(lb(p, LX_PRE_HI_REG(n))), &bp->preamble[0]);
++	put_unaligned_be32(readl(lb(p, LX_PRE_LO_REG(n))), &bp->preamble[4]);
++	put_unaligned_be32(readl(lb(p, LX_DELIM_HI_REG(n))),
++			   &bp->delimiter[0]);
++	put_unaligned_be32(readl(lb(p, LX_DELIM_LO_REG(n))),
++			   &bp->delimiter[4]);
++	shape = readl(lb(p, LX_BURST_SHAPE_REG(n)));
++	spin_unlock_irqrestore(&p->reg_lock, flags);
++
++	bp->delimiter_len = FIELD_GET(LX_SHAPE_DELIM_LEN, shape);
++	bp->preamble_len = FIELD_GET(LX_SHAPE_PRE_LEN, shape);
++	bp->preamble_repeat = FIELD_GET(LX_SHAPE_PRE_REPEAT, shape);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_get_burst_profile);
++
++/**
++ * en7581_pon_phy_set_receiver() - turn the XGS-PON receiver on or off
++ * @phy: the PON PHY
++ * @on: the new state
++ *
++ * Return: 0, -EOPNOTSUPP in GPON, or another negative error code.
++ */
++int en7581_pon_phy_set_receiver(struct phy *phy, bool on)
++{
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (!p->xgs)
++		return -EOPNOTSUPP;
++	pon_bit(p, lb(p, LX_RX_REG), LX_RX_ON, on);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_receiver);
++
++/**
++ * en7581_pon_phy_set_polarity() - set which optic signals are inverted
++ * @phy: the PON PHY
++ * @pol: the polarities
++ * @sets: EN7581_PON_POL_* bits, the sets of @pol to apply
++ *
++ * The transmit set and the receive set live in different registers, and
++ * each is written only when @sets names it: the fields of @pol outside the
++ * named sets are ignored and their registers left alone. The transmit set
++ * is written whole, all three signals, whether or not any of them changes.
++ * Only GPON sets them; in XGS-PON nothing is written.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_set_polarity(struct phy *phy,
++				const struct en7581_pon_polarity *pol,
++				unsigned int sets)
++{
++	struct en7581_pon *p;
++	int err;
++
++	if (sets & ~EN7581_PON_POL_ALL)
++		return -EINVAL;
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (p->xgs)
++		return 0;
++	if (sets & EN7581_PON_POL_TX) {
++		pon_bit(p, sd(p, PMA_OPTIC_B_REG), PMA_OPTIC_TX_SD_INV,
++			pol->invert_tx_detect);
++		pon_rmw(p, sd(p, PMA_OPTIC_A_REG),
++			PMA_OPTIC_BEN_INV | PMA_OPTIC_FAULT_INV,
++			(pol->invert_burst_enable ? PMA_OPTIC_BEN_INV : 0) |
++			(pol->invert_tx_fault ? PMA_OPTIC_FAULT_INV : 0));
++	}
++	if (sets & EN7581_PON_POL_RX)
++		pon_bit(p, lb(p, LG_OPTIC_REG), LG_OPTIC_RX_SD_INV,
++			pol->invert_rx_detect);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_polarity);
++
++/**
++ * en7581_pon_phy_get_polarity() - read which optic signals are inverted
++ * @phy: the PON PHY
++ * @pol: the polarities
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_get_polarity(struct phy *phy,
++				struct en7581_pon_polarity *pol)
++{
++	struct en7581_pon *p;
++	u32 a;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	a = readl(sd(p, PMA_OPTIC_A_REG));
++	pol->invert_tx_detect = readl(sd(p, PMA_OPTIC_B_REG)) &
++				 PMA_OPTIC_TX_SD_INV;
++	pol->invert_burst_enable = a & PMA_OPTIC_BEN_INV;
++	pol->invert_tx_fault = a & PMA_OPTIC_FAULT_INV;
++	if (p->xgs)
++		pol->invert_rx_detect = a & PMA_OPTIC_RX_SD_INV;
++	else
++		pol->invert_rx_detect = readl(lb(p, LG_OPTIC_REG)) &
++					LG_OPTIC_RX_SD_INV;
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_get_polarity);
++
++/**
++ * en7581_pon_phy_set_transmitter() - turn the optical transmitter on or off
++ * @phy: the PON PHY
++ * @on: the new state
++ *
++ * Takes effect at once, powered on or not, and from any context; a PHY whose
++ * board has no transmit-disable line ignores it. Off holds until the MAC
++ * turns the transmitter on again or phy_init() runs: the PHY's own serdes
++ * resets, mode selections and phy_reset() leave it off. On while the PHY has
++ * the transmitter off for a reset waits for the reset to end.
++ *
++ * Return: 0, or -EINVAL if @phy is not an EN7581 PON PHY.
++ */
++int en7581_pon_phy_set_transmitter(struct phy *phy, bool on)
++{
++	struct en7581_pon *p = pon_of(phy);
++	unsigned long flags;
++
++	if (!p)
++		return -EINVAL;
++	spin_lock_irqsave(&p->tx_lock, flags);
++	p->tx_allowed = on;
++	if (!on || !p->tx_held)
++		gpiod_set_value(p->tx_off, !on);
++	spin_unlock_irqrestore(&p->tx_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_transmitter);
++
++static int pon_gpio_force(struct en7581_pon *p, bool on)
++{
++	if (on)
++		return regmap_write_bits(p->chip, CHIP_GPIO_FORCE_REG,
++					 CHIP_FORCE_BEN | CHIP_FORCE_GPIO32,
++					 CHIP_FORCE_BEN | CHIP_FORCE_GPIO32);
++	return regmap_write_bits(p->chip, CHIP_GPIO_FORCE_REG, CHIP_FORCE_BEN, 0);
++}
++
++/**
++ * en7581_pon_phy_set_continuous_tx() - transmit continuously, a test mode
++ * @phy: the PON PHY
++ * @on: transmit continuously rather than in bursts
++ *
++ * In GPON, turning it off also turns the transmitter on, unless the MAC has
++ * turned it off.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_set_continuous_tx(struct phy *phy, bool on)
++{
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	if (p->xgs) {
++		pon_wr(p, lb(p, LX_TX_CONT_REG), on ? LX_TX_CONT_ON : 0);
++		return 0;
++	}
++	err = pon_gpio_force(p, on);
++	if (!err && !on)
++		pon_tx(p, true);
++	return err;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_continuous_tx);
++
++/**
++ * en7581_pon_phy_get_continuous_tx() - whether the transmitter is continuous
++ * @phy: the PON PHY
++ * @on: set when it is
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_get_continuous_tx(struct phy *phy, bool *on)
++{
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	*on = !(readl(sd(p, PMA_TX_NORMAL_REG)) & PMA_TX_NORMAL) &&
++	      FIELD_GET(PMA_TX_FORCE, readl(sd(p, PMA_TX_FORCE_REG))) ==
++	      FIELD_MAX(PMA_TX_FORCE);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_get_continuous_tx);
++
++static int pon_test_pattern_gpon(struct en7581_pon *p, bool on,
++				 unsigned int pattern, bool in_grants)
++{
++	if (on && pattern > (in_grants ? 3 : 1))
++		return -EINVAL;
++
++	pon_test_pattern_catch_up(p);
++
++	if (!on) {
++		pon_rmw(p, sd(p, PMA_TEST_PAT_REG),
++			PMA_TEST_PAT | PMA_TEST_PAT_SEND, 0);
++		pon_rmw(p, sd(p, PMA_TX_SRC_REG),
++			PMA_TX_RX_CLK | PMA_TX_PATTERN, 0);
++		pon_field(p, sd(p, PMA_CLK_SEL_REG), PMA_CLK_SEL,
++			  PMA_CLK_SEL_TEST);
++		pon_field(p, sd(p, PMA_BEN_SRC_REG), PMA_BEN_SRC,
++			  PMA_BEN_NORMAL);
++		return pon_gpio_force(p, false);
++	}
++	if (in_grants) {
++		pon_rmw(p, sd(p, PMA_TEST_PAT_REG),
++			PMA_TEST_PAT | PMA_TEST_PAT_SEND,
++			FIELD_PREP(PMA_TEST_PAT, pattern + 1) |
++			PMA_TEST_PAT_SEND);
++		pon_rmw(p, sd(p, PMA_TX_SRC_REG),
++			PMA_TX_RX_CLK | PMA_TX_PATTERN, PMA_TX_PATTERN);
++		return 0;
++	}
++	pon_field(p, sd(p, PMA_CLK_SEL_REG), PMA_CLK_SEL, PMA_CLK_SEL_TEST);
++	pon_field(p, sd(p, PMA_BEN_SRC_REG), PMA_BEN_SRC, pattern + 2);
++	return pon_gpio_force(p, true);
++}
++
++static int pon_test_pattern_xgs(struct en7581_pon *p, bool on,
++				unsigned int pattern, bool in_grants)
++{
++	if (on && pattern > FIELD_MAX(LX_TX_CONT_PATTERN))
++		return -EINVAL;
++
++	pon_test_pattern_catch_up(p);
++
++	pon_wr(p, lb(p, LX_TX_CONT_REG), !on ? 0 :
++	       LX_TX_CONT_ON | FIELD_PREP(LX_TX_CONT_PATTERN, pattern) |
++	       (in_grants ? LX_TX_CONT_IN_GRANTS : 0));
++	return 0;
++}
++
++/**
++ * en7581_pon_phy_set_test_pattern() - send a test pattern upstream
++ * @phy: the PON PHY
++ * @on: start, or stop and go back to normal bursts
++ * @pattern: the pattern: 0 to 3, except 0 to 1 in GPON outside the grants
++ * @in_grants: send it inside the granted slots as well as outside them;
++ *	GPON sends it either inside the grants or outside them
++ *
++ * In XGS-PON, patterns 0, 1 and 2 are pseudo-random sequences of order 7, 23
++ * and 31 and pattern 3 a fixed one. Sleeps.
++ *
++ * Return: 0 or a negative error code.
++ */
++int en7581_pon_phy_set_test_pattern(struct phy *phy, bool on,
++				    unsigned int pattern, bool in_grants)
++{
++	struct en7581_pon *p;
++	int err;
++
++	err = pon_get(phy, &p);
++	if (err)
++		return err;
++	mutex_lock(&p->lock);
++	if (!p->powered)
++		err = -ENODEV;
++	else if (p->xgs)
++		err = pon_test_pattern_xgs(p, on, pattern, in_grants);
++	else
++		err = pon_test_pattern_gpon(p, on, pattern, in_grants);
++	mutex_unlock(&p->lock);
++	return err;
++}
++EXPORT_SYMBOL_GPL(en7581_pon_phy_set_test_pattern);
++
++/*
++ * On removal: the transmitter off, and kept off, as if the MAC's
++ * last call had turned it off.
++ */
++static void pon_unload_tx_off(void *data)
++{
++	struct en7581_pon *p = data;
++	unsigned long flags;
++
++	spin_lock_irqsave(&p->tx_lock, flags);
++	p->tx_allowed = false;
++	spin_unlock_irqrestore(&p->tx_lock, flags);
++	pon_tx(p, false);
++}
++
++static int en7581_pon_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct phy_provider *provider;
++	struct device_node *np;
++	struct en7581_pon *p;
++	int err;
++
++	p = devm_kzalloc(dev, sizeof(*p), GFP_KERNEL);
++	if (!p)
++		return -ENOMEM;
++	p->dev = dev;
++	spin_lock_init(&p->tx_lock);
++	p->tx_allowed = true;
++
++	/*
++	 * The transmit-disable line first, taken asserted: the transmitter is
++	 * off from here on, whatever the boot left (a kexec from the vendor
++	 * kernel leaves it released), a probe that fails or defers below
++	 * included, and the driver's unbind turns it off again.
++	 */
++	p->tx_off = devm_gpiod_get_optional(dev, "tx-disable", GPIOD_OUT_HIGH);
++	if (IS_ERR(p->tx_off))
++		return dev_err_probe(dev, PTR_ERR(p->tx_off),
++				     "no transmit-disable line\n");
++	if (!p->tx_off)
++		dev_warn(dev, "no transmit-disable line: the transmitter is not switched\n");
++	/* The MAC turns the transmitter off from interrupt context. */
++	if (gpiod_cansleep(p->tx_off))
++		return dev_err_probe(dev, -EINVAL,
++				     "transmit-disable line must not sleep\n");
++	err = devm_add_action_or_reset(dev, pon_unload_tx_off, p);
++	if (err)
++		return err;
++
++	p->line = devm_platform_ioremap_resource_byname(pdev, "line");
++	if (IS_ERR(p->line))
++		return PTR_ERR(p->line);
++
++	p->serdes = devm_platform_ioremap_resource_byname(pdev, "serdes");
++	if (IS_ERR(p->serdes))
++		return PTR_ERR(p->serdes);
++
++	np = of_parse_phandle(dev->of_node, "airoha,system-controller", 0);
++	if (!np)
++		return dev_err_probe(dev, -ENODEV, "no system controller\n");
++	p->scu = device_node_to_regmap(np);
++	of_node_put(np);
++	if (IS_ERR(p->scu))
++		return dev_err_probe(dev, PTR_ERR(p->scu),
++				     "system controller not reachable\n");
++
++	p->chip = syscon_regmap_lookup_by_phandle(dev->of_node,
++						  "airoha,chip-controller");
++	if (IS_ERR(p->chip))
++		return dev_err_probe(dev, PTR_ERR(p->chip),
++				     "chip controller not reachable\n");
++
++	/*
++	 * Set the PON pin mode once at probe. Its pins
++	 * carry the optic's burst enable: without the mode the MAC reaches O3
++	 * but the laser never sees a burst, and the OLT never hears the ONU.
++	 * Written here, not claimed through the pin controller, whose "pon"
++	 * group also takes GPIO 38, the transmit-disable line taken above.
++	 */
++	err = regmap_write_bits(p->chip, CHIP_PON_PINS_REG, CHIP_PON_PINS,
++				CHIP_PON_PINS);
++	if (err)
++		return dev_err_probe(dev, err, "cannot set the PON pin mode\n");
++
++	p->rst = devm_reset_control_get_exclusive(dev, NULL);
++	if (IS_ERR(p->rst))
++		return dev_err_probe(dev, PTR_ERR(p->rst), "no reset line\n");
++
++	p->poll_ms = POLL_MS;
++	spin_lock_init(&p->reg_lock);
++	err = devm_mutex_init(dev, &p->lock);
++	if (err)
++		return err;
++	err = devm_delayed_work_autocancel(dev, &p->poll, pon_poll_work);
++	if (err)
++		return err;
++	err = devm_delayed_work_autocancel(dev, &p->watch, pon_watch_work);
++	if (err)
++		return err;
++
++	p->phy = devm_phy_create(dev, NULL, &en7581_pon_ops);
++	if (IS_ERR(p->phy))
++		return dev_err_probe(dev, PTR_ERR(p->phy),
++				     "cannot create the PHY\n");
++	phy_set_drvdata(p->phy, p);
++
++	provider = devm_of_phy_provider_register(dev, of_phy_simple_xlate);
++	return PTR_ERR_OR_ZERO(provider);
++}
++
++static const struct of_device_id en7581_pon_of_match[] = {
++	{ .compatible = "airoha,en7581-pon-phy" },
++	{ /* sentinel */ }
++};
++MODULE_DEVICE_TABLE(of, en7581_pon_of_match);
++
++static struct platform_driver en7581_pon_driver = {
++	.probe = en7581_pon_probe,
++	.driver = {
++		.name = "phy-en7581-pon",
++		.of_match_table = en7581_pon_of_match,
++		/* A MAC holding the PHY would keep its freed state. */
++		.suppress_bind_attrs = true,
++	},
++};
++module_platform_driver(en7581_pon_driver);
++
++MODULE_DESCRIPTION("Airoha EN7581 PON PHY driver");
++MODULE_LICENSE("GPL");
+diff --git a/drivers/phy/airoha/phy-en7581-pon-seq.c b/drivers/phy/airoha/phy-en7581-pon-seq.c
+new file mode 100644
+index 0000000..97a5c08
+--- /dev/null
++++ b/drivers/phy/airoha/phy-en7581-pon-seq.c
+@@ -0,0 +1,1235 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * EN7581 PON PHY: the fixed serdes write sequences, as tables.
++ *
++ * Register sequence definitions. These C tables are the editable source
++ * for the contributed driver; no external sequence specification is required.
++ */
++
++#include "phy-en7581-pon.h"
++
++/*
++ * serdes_prep (both): Turn the reference and transmit PLLs off and set the
++ * reference PLL up.
++ */
++static const struct pon_step seq_serdes_prep[] = {
++	PON_SET(SERDES_PMA, 0x828, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x828, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x79c, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x800, 31, 0, 0x25800000),
++	PON_SET(SERDES_PMA, 0x854, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x854, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x034, 1, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x02c, 11, 8, 0x5),
++	PON_SET(SERDES_ANA, 0x0c8, 17, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x0d8, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x004, 31, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x004, 23, 16, 0x10),
++	PON_SET(SERDES_PMA, 0x004, 15, 8, 0xa),
++	PON_SET(SERDES_PMA, 0x004, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x444, 31, 16, 0x113),
++	PON_SET(SERDES_PMA, 0x444, 15, 0, 0xfa),
++	PON_SET(SERDES_PMA, 0x448, 31, 16, 0x9b),
++	PON_SET(SERDES_PMA, 0x448, 15, 0, 0x210),
++	PON_SET(SERDES_PMA, 0x440, 31, 16, 0x4),
++	PON_SET(SERDES_PMA, 0x440, 15, 0, 0x26),
++	PON_SET(SERDES_PMA, 0x468, 23, 16, 0x2),
++	PON_SET(SERDES_PMA, 0x028, 10, 8, 0x3),
++	PON_SET(SERDES_PMA, 0x024, 24, 24, 0x0),
++};
++
++/* txpll_setup (both): Transmit PLL settings; the same for both line rates. */
++static const struct pon_step seq_txpll_setup[] = {
++	PON_SET(SERDES_PMA, 0x794, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x034, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x798, 30, 0, 0x7f66e86),
++	PON_SET(SERDES_PMA, 0x048, 30, 0, 0xfecdd0c),
++	PON_SET(SERDES_PMA, 0x04c, 30, 0, 0xfecdd0c),
++};
++
++/* tx_rate (gpon): Transmitter settings for the line rate. */
++static const struct pon_step seq_tx_rate_gpon[] = {
++	PON_SET(SERDES_ANA, 0x0c4, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x0c4, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x000, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x000, 18, 16, 0x4),
++	PON_SET(SERDES_ANA, 0x000, 13, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x874, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x874, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x77c, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x77c, 19, 16, 0x2),
++	PON_SET(SERDES_PMA, 0x784, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x784, 1, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x580, 1, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x468, 6, 0, 0x4),
++};
++
++/* tx_rate (xgspon): Transmitter settings for the line rate. */
++static const struct pon_step seq_tx_rate_xgspon[] = {
++	PON_SET(SERDES_ANA, 0x0c4, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x0c4, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x000, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x000, 18, 16, 0x4),
++	PON_SET(SERDES_ANA, 0x000, 13, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x874, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x874, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x77c, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x77c, 19, 16, 0x5),
++	PON_SET(SERDES_PMA, 0x784, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x784, 1, 0, 0x2),
++	PON_SET(SERDES_PMA, 0x580, 1, 0, 0x2),
++	PON_SET(SERDES_PMA, 0x468, 6, 0, 0x30),
++	PON_SET(SERDES_PMA, 0x468, 14, 8, 0xd),
++};
++
++/* serdes_common_mid (both): Shared serdes settings between the rate tables. */
++static const struct pon_step seq_serdes_common_mid[] = {
++	PON_SET(SERDES_PMA, 0x08c, 23, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x104, 15, 0, 0x2),
++	PON_SET(SERDES_PMA, 0x08c, 2, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x090, 15, 0, 0x2),
++	PON_SET(SERDES_PMA, 0x090, 31, 16, 0x3e8),
++	PON_SET(SERDES_PMA, 0x09c, 15, 0, 0x2),
++	PON_SET(SERDES_PMA, 0x09c, 31, 16, 0x3e8),
++	PON_SET(SERDES_PMA, 0x094, 15, 0, 0x2),
++	PON_SET(SERDES_PMA, 0x094, 31, 16, 0x3e8),
++	PON_SET(SERDES_PMA, 0x098, 15, 0, 0x2),
++	PON_SET(SERDES_PMA, 0x098, 31, 16, 0x3e8),
++	PON_SET(SERDES_PMA, 0x120, 12, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x120, 1, 0, 0x3),
++	PON_SET(SERDES_PMA, 0x068, 26, 16, 0x240),
++	PON_SET(SERDES_PMA, 0x068, 10, 0, 0x1c0),
++	PON_SET(SERDES_PMA, 0x088, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x088, 0, 0, 0x1),
++};
++
++/* rx_rate (gpon): Receiver settings for the line rate. */
++static const struct pon_step seq_rx_rate_gpon[] = {
++	PON_SET(SERDES_ANA, 0x0d4, 15, 0, 0x1030),
++	PON_SET(SERDES_ANA, 0x0d4, 31, 16, 0xcccb),
++	PON_SET(SERDES_ANA, 0x144, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x148, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x148, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x148, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x148, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x13c, 19, 8, 0x200),
++	PON_SET(SERDES_ANA, 0x120, 17, 8, 0x3ff),
++	PON_SET(SERDES_ANA, 0x0dc, 8, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x0dc, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x80c, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x80c, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x814, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x814, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x10c, 28, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x0d8, 9, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x10c, 2, 2, 0x0),
++	PON_SET(SERDES_PMA, 0x360, 31, 0, 0x300),
++	PON_SET(SERDES_ANA, 0x0cc, 24, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x0cc, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x0d8, 7, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x0d8, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x0e8, 1, 0, 0x2),
++	PON_SET(SERDES_ANA, 0x0cc, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x0cc, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x76c, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x76c, 17, 16, 0x2),
++	PON_SET(SERDES_PMA, 0x374, 1, 0, 0x2),
++};
++
++/* rx_rate (xgspon): Receiver settings for the line rate. */
++static const struct pon_step seq_rx_rate_xgspon[] = {
++	PON_SET(SERDES_ANA, 0x0d4, 15, 0, 0x1030),
++	PON_SET(SERDES_ANA, 0x0d4, 31, 16, 0xcccb),
++	PON_SET(SERDES_ANA, 0x144, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x148, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x148, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x148, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x148, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x13c, 19, 8, 0x200),
++	PON_SET(SERDES_ANA, 0x120, 17, 8, 0x3ff),
++	PON_SET(SERDES_ANA, 0x0dc, 8, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x0dc, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x80c, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x80c, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x814, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x814, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x10c, 28, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x0d8, 9, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x10c, 2, 2, 0x1),
++	PON_SET(SERDES_PMA, 0x360, 31, 0, 0x100),
++	PON_SET(SERDES_ANA, 0x0cc, 24, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x0cc, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x0d8, 7, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x0d8, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x0e8, 1, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x0cc, 8, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x0cc, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x76c, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x76c, 17, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x374, 1, 0, 0x2),
++};
++
++/*
++ * analog_rate (gpon): Analog front-end and PLL loop settings for the line
++ * rate.
++ */
++static const struct pon_step seq_analog_rate_gpon[] = {
++	PON_SET(SERDES_ANA, 0x048, 15, 8, 0x20),
++	PON_SET(SERDES_ANA, 0x048, 7, 0, 0xff),
++	PON_SET(SERDES_ANA, 0x01c, 2, 0, 0x4),
++	PON_SET(SERDES_ANA, 0x01c, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x01c, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x01c, 25, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x020, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x020, 9, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x020, 17, 16, 0x3),
++	PON_SET(SERDES_ANA, 0x020, 24, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x024, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x038, 15, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x038, 31, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x034, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x034, 23, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x030, 17, 17, 0x0),
++	PON_SET(SERDES_ANA, 0x030, 10, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x030, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x004, 21, 16, 0x18),
++	PON_SET(SERDES_ANA, 0x004, 29, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x004, 8, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x008, 28, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x008, 20, 16, 0x10),
++	PON_SET(SERDES_ANA, 0x008, 12, 8, 0x1f),
++	PON_SET(SERDES_ANA, 0x008, 4, 0, 0xa),
++	PON_SET(SERDES_ANA, 0x00c, 4, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x02c, 9, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x02c, 26, 24, 0x4),
++	PON_SET(SERDES_ANA, 0x02c, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x030, 5, 3, 0x3),
++	PON_SET(SERDES_ANA, 0x030, 10, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x030, 2, 0, 0x5),
++	PON_SET(SERDES_ANA, 0x014, 1, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x014, 24, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x02c, 1, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x010, 1, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x010, 9, 8, 0x3),
++	PON_SET(SERDES_ANA, 0x010, 17, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x00c, 26, 24, 0x2),
++	PON_SET(SERDES_ANA, 0x00c, 23, 16, 0xe4),
++	PON_SET(SERDES_ANA, 0x00c, 8, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x04c, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x884, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x884, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x048, 20, 16, 0x10),
++	PON_SET(SERDES_ANA, 0x024, 18, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x024, 28, 24, 0x5),
++	PON_SET(SERDES_ANA, 0x024, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x028, 26, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x028, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x028, 10, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x028, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x0a0, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x0a4, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x0a4, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x0a8, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x084, 25, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x084, 17, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x088, 25, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x088, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x088, 10, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x088, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x064, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x064, 18, 16, 0x4),
++	PON_SET(SERDES_ANA, 0x064, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x064, 9, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x068, 25, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x068, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x068, 9, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x068, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x06c, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x06c, 8, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x06c, 1, 0, 0x3),
++	PON_SET(SERDES_ANA, 0x080, 31, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x080, 15, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x07c, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x07c, 8, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x07c, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x084, 15, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x050, 28, 24, 0x1f),
++	PON_SET(SERDES_ANA, 0x050, 20, 16, 0x5),
++	PON_SET(SERDES_ANA, 0x050, 13, 8, 0x8),
++	PON_SET(SERDES_ANA, 0x050, 5, 0, 0x1f),
++	PON_SET(SERDES_ANA, 0x054, 20, 16, 0xc),
++	PON_SET(SERDES_ANA, 0x054, 12, 8, 0xb),
++	PON_SET(SERDES_ANA, 0x054, 4, 0, 0x2),
++	PON_SET(SERDES_ANA, 0x04c, 25, 25, 0x1),
++	PON_SET(SERDES_ANA, 0x074, 25, 24, 0x3),
++	PON_SET(SERDES_ANA, 0x078, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x078, 10, 8, 0x7),
++	PON_SET(SERDES_ANA, 0x078, 26, 24, 0x4),
++	PON_SET(SERDES_ANA, 0x078, 29, 27, 0x0),
++	PON_SET(SERDES_ANA, 0x078, 18, 16, 0x4),
++	PON_SET(SERDES_ANA, 0x058, 25, 24, 0x3),
++	PON_SET(SERDES_ANA, 0x058, 17, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x05c, 1, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x058, 10, 8, 0x4),
++	PON_SET(SERDES_ANA, 0x058, 7, 0, 0xe4),
++	PON_SET(SERDES_ANA, 0x054, 24, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x094, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x858, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x858, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x05c, 17, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x05c, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x074, 17, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x094, 4, 0, 0xf),
++	PON_SET(SERDES_ANA, 0x070, 2, 0, 0x3),
++	PON_SET(SERDES_ANA, 0x070, 12, 8, 0xb),
++	PON_SET(SERDES_ANA, 0x074, 10, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x074, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x06c, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x0b4, 1, 0, 0x2),
++	PON_SET(SERDES_ANA, 0x0c0, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x0c0, 18, 16, 0x2),
++	PON_SET(SERDES_ANA, 0x0c0, 26, 24, 0x2),
++	PON_SET(SERDES_PMA, 0x778, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x778, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x780, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x780, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x778, 20, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x778, 5, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x780, 4, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x780, 18, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x118, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x118, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x118, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x11c, 10, 8, 0x4),
++	PON_SET(SERDES_ANA, 0x118, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x11c, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x0e8, 26, 8, 0x20000),
++	PON_SET(SERDES_ANA, 0x100, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x0d8, 24, 24, 0x1),
++};
++
++/*
++ * analog_rate (xgspon): Analog front-end and PLL loop settings for the line
++ * rate.
++ */
++static const struct pon_step seq_analog_rate_xgspon[] = {
++	PON_SET(SERDES_ANA, 0x048, 15, 8, 0x20),
++	PON_SET(SERDES_ANA, 0x048, 7, 0, 0xff),
++	PON_SET(SERDES_ANA, 0x01c, 2, 0, 0x4),
++	PON_SET(SERDES_ANA, 0x01c, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x01c, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x01c, 25, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x020, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x020, 9, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x020, 17, 16, 0x3),
++	PON_SET(SERDES_ANA, 0x020, 24, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x024, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x038, 15, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x038, 31, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x034, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x034, 23, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x030, 17, 17, 0x0),
++	PON_SET(SERDES_ANA, 0x030, 10, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x030, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x004, 21, 16, 0x18),
++	PON_SET(SERDES_ANA, 0x004, 29, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x004, 8, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x008, 28, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x008, 20, 16, 0x10),
++	PON_SET(SERDES_ANA, 0x008, 12, 8, 0x1f),
++	PON_SET(SERDES_ANA, 0x008, 4, 0, 0xa),
++	PON_SET(SERDES_ANA, 0x00c, 4, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x02c, 9, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x02c, 26, 24, 0x4),
++	PON_SET(SERDES_ANA, 0x02c, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x030, 5, 3, 0x3),
++	PON_SET(SERDES_ANA, 0x030, 10, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x030, 2, 0, 0x5),
++	PON_SET(SERDES_ANA, 0x014, 1, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x014, 24, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x02c, 1, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x010, 1, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x010, 9, 8, 0x3),
++	PON_SET(SERDES_ANA, 0x010, 17, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x00c, 26, 24, 0x2),
++	PON_SET(SERDES_ANA, 0x00c, 23, 16, 0xe4),
++	PON_SET(SERDES_ANA, 0x00c, 8, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x04c, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x884, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x884, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x048, 20, 16, 0x10),
++	PON_SET(SERDES_ANA, 0x024, 18, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x024, 28, 24, 0x5),
++	PON_SET(SERDES_ANA, 0x024, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x028, 26, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x028, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x028, 10, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x028, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x0a0, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x0a4, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x0a4, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x0a8, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x084, 25, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x084, 17, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x088, 25, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x088, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x088, 10, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x088, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x064, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x064, 18, 16, 0x4),
++	PON_SET(SERDES_ANA, 0x064, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x064, 9, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x068, 25, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x068, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x068, 9, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x068, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x06c, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x06c, 8, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x06c, 1, 0, 0x3),
++	PON_SET(SERDES_ANA, 0x080, 31, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x080, 15, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x07c, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x07c, 8, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x07c, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x084, 15, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x050, 28, 24, 0x1f),
++	PON_SET(SERDES_ANA, 0x050, 20, 16, 0x5),
++	PON_SET(SERDES_ANA, 0x050, 13, 8, 0x8),
++	PON_SET(SERDES_ANA, 0x050, 5, 0, 0x1f),
++	PON_SET(SERDES_ANA, 0x054, 20, 16, 0xc),
++	PON_SET(SERDES_ANA, 0x054, 12, 8, 0xb),
++	PON_SET(SERDES_ANA, 0x054, 4, 0, 0x2),
++	PON_SET(SERDES_ANA, 0x04c, 25, 25, 0x1),
++	PON_SET(SERDES_ANA, 0x074, 25, 24, 0x3),
++	PON_SET(SERDES_ANA, 0x078, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x078, 10, 8, 0x7),
++	PON_SET(SERDES_ANA, 0x078, 26, 24, 0x4),
++	PON_SET(SERDES_ANA, 0x078, 29, 27, 0x0),
++	PON_SET(SERDES_ANA, 0x078, 18, 16, 0x4),
++	PON_SET(SERDES_ANA, 0x058, 25, 24, 0x3),
++	PON_SET(SERDES_ANA, 0x058, 17, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x05c, 1, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x058, 10, 8, 0x5),
++	PON_SET(SERDES_ANA, 0x058, 7, 0, 0xe4),
++	PON_SET(SERDES_ANA, 0x054, 24, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x094, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x858, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x858, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x05c, 17, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x05c, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x074, 17, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x094, 4, 0, 0xf),
++	PON_SET(SERDES_ANA, 0x070, 2, 0, 0x3),
++	PON_SET(SERDES_ANA, 0x070, 12, 8, 0xb),
++	PON_SET(SERDES_ANA, 0x074, 10, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x074, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x06c, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x0b4, 1, 0, 0x2),
++	PON_SET(SERDES_ANA, 0x0c0, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x0c0, 18, 16, 0x2),
++	PON_SET(SERDES_ANA, 0x0c0, 26, 24, 0x2),
++	PON_SET(SERDES_PMA, 0x778, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x778, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x780, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x780, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x778, 20, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x778, 5, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x780, 4, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x780, 18, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x118, 24, 24, 0x1),
++	PON_SET(SERDES_ANA, 0x118, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x118, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x11c, 10, 8, 0x4),
++	PON_SET(SERDES_ANA, 0x118, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x11c, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x0e8, 26, 8, 0x20000),
++	PON_SET(SERDES_ANA, 0x100, 16, 16, 0x0),
++	PON_SET(SERDES_ANA, 0x0d8, 24, 24, 0x1),
++};
++
++/*
++ * serdes_common_tail (both): Shared serdes settings after the rate tables:
++ * PLL hardware-mode timers, transmit and receive sequencer counts,
++ * equaliser, eye monitor, frequency-lock loop and baseline defaults.
++ */
++static const struct pon_step seq_serdes_common_tail[] = {
++	PON_SET(SERDES_PMA, 0x074, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x078, 15, 8, 0x4),
++	PON_SET(SERDES_PMA, 0x078, 7, 0, 0x4),
++	PON_SET(SERDES_PMA, 0x07c, 23, 16, 0x4),
++	PON_SET(SERDES_PMA, 0x07c, 10, 0, 0x4),
++	PON_SET(SERDES_PMA, 0x080, 31, 24, 0xff),
++	PON_SET(SERDES_PMA, 0x080, 9, 0, 0xd0),
++	PON_SET(SERDES_PMA, 0x118, 7, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x118, 18, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x118, 31, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x11c, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x160, 25, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x160, 15, 8, 0x2e),
++	PON_SET(SERDES_PMA, 0x160, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x160, 17, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x164, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x164, 11, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x164, 17, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x100, 15, 0, 0x5),
++	PON_SET(SERDES_PMA, 0x100, 31, 16, 0xa),
++	PON_SET(SERDES_PMA, 0x144, 7, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x144, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x06c, 6, 0, 0x40),
++	PON_SET(SERDES_PMA, 0x06c, 14, 8, 0x3f),
++	PON_SET(SERDES_PMA, 0x06c, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x070, 19, 0, 0x18),
++	PON_SET(SERDES_PMA, 0x48c, 15, 8, 0x2),
++	PON_SET(SERDES_PMA, 0x48c, 1, 1, 0x1),
++	PON_SET(SERDES_PMA, 0x48c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x170, 18, 8, 0xa5),
++	PON_SET(SERDES_PMA, 0x170, 2, 0, 0x3),
++	PON_SET(SERDES_PMA, 0x170, 25, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x174, 26, 24, 0x4),
++	PON_SET(SERDES_PMA, 0x174, 18, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x184, 10, 0, 0x1ff),
++	PON_SET(SERDES_PMA, 0x184, 26, 16, 0x400),
++	PON_SET(SERDES_PMA, 0x178, 10, 8, 0x4),
++	PON_SET(SERDES_PMA, 0x178, 2, 0, 0x3),
++	PON_SET(SERDES_PMA, 0x320, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x200, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x200, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x148, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x148, 11, 8, 0xa),
++	PON_SET(SERDES_PMA, 0x148, 22, 16, 0x70),
++	PON_SET(SERDES_PMA, 0x148, 29, 23, 0x10),
++};
++
++/*
++ * clocks_up (both): Start the reference PLL, then the transmit PLL, then the
++ * digital clocks, then the transmitter, with the settle waits between them.
++ */
++static const struct pon_step seq_clocks_up[] = {
++	PON_SET(SERDES_PMA, 0x828, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x828, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x828, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x828, 0, 0, 0x1),
++	PON_WAIT(500),
++	PON_SET(SERDES_PMA, 0x854, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x854, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x000, 24, 24, 0x1),
++	PON_WAIT(6),
++	PON_SET(SERDES_ANA, 0x04c, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x854, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x854, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x094, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x094, 8, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x060, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x060, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x04c, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x04c, 24, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x04c, 16, 16, 0x0),
++	PON_WAIT(500),
++	PON_SET(SERDES_PMA, 0x14c, 31, 16, 0x7fff),
++	PON_SET(SERDES_PMA, 0x14c, 15, 0, 0x7fff),
++	PON_SET(SERDES_PMA, 0x150, 31, 16, 0xa4ff),
++	PON_SET(SERDES_PMA, 0x150, 15, 0, 0xa436),
++	PON_SET(SERDES_PMA, 0x154, 31, 16, 0xa4ff),
++	PON_SET(SERDES_PMA, 0x154, 15, 0, 0xa436),
++	PON_SET(SERDES_PMA, 0x260, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x410, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x410, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x260, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x260, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x414, 16, 16, 0x1),
++	PON_WAIT(100),
++};
++
++/*
++ * rx_start (both): Receiver bring-up up to the CDR current search: preset
++ * the receiver, stop the time-to-digital converter, power the receiver on.
++ */
++static const struct pon_step seq_rx_start[] = {
++	PON_SET(SERDES_ANA, 0x114, 9, 8, 0x2),
++	PON_SET(SERDES_ANA, 0x114, 20, 16, 0x2),
++	PON_SET(SERDES_ANA, 0x110, 25, 24, 0x3),
++	PON_SET(SERDES_ANA, 0x10c, 19, 19, 0x0),
++	PON_SET(SERDES_ANA, 0x10c, 18, 16, 0x7),
++	PON_SET(SERDES_PMA, 0x114, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x10c, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x818, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x818, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x768, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x768, 19, 16, 0x4),
++	PON_SET(SERDES_PMA, 0x88c, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x88c, 1, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x330, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x33c, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x330, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x33c, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x338, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x32c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x10c, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x114, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x034, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x02c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x010, 0, 0, 0x0),
++	PON_WAIT(1000),
++	PON_SET(SERDES_PMA, 0x824, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x824, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x824, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x824, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x81c, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x81c, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x81c, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x81c, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x894, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x894, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x84c, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x84c, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x84c, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x84c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x818, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x818, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x34c, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x34c, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x34c, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x34c, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x350, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x38c, 1, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x0fc, 25, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x0fc, 20, 16, 0x8),
++	PON_SET(SERDES_ANA, 0x0fc, 10, 8, 0x5),
++	PON_SET(SERDES_ANA, 0x0fc, 2, 0, 0x5),
++	PON_SET(SERDES_PMA, 0x108, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x108, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x108, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x10c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x108, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x10c, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x808, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x808, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x100, 1, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x108, 25, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 1, 1, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 5, 5, 0x1),
++	PON_SET(SERDES_PMA, 0x818, 16, 16, 0x0),
++	PON_WAIT(100),
++	PON_SET(SERDES_PMA, 0x818, 16, 16, 0x1),
++};
++
++/*
++ * rx_trim (both): Receiver bring-up after the CDR current search: lock the
++ * CDR to the reference, run the offset and phase calibrations, pulse the PMA
++ * soft resets, hand the CDR to the data.
++ */
++static const struct pon_step seq_rx_trim[] = {
++	PON_SET(SERDES_PMA, 0x818, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x818, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x818, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x818, 8, 8, 0x0),
++	PON_WAIT(100),
++	PON_SET(SERDES_PMA, 0x33c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x330, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x83c, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x83c, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x840, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x840, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x840, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x840, 0, 0, 0x1),
++	PON_WAIT(200),
++	PON_SET(SERDES_PMA, 0x108, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x10c, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x110, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x114, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x110, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x308, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x15c, 10, 8, 0x4),
++	PON_SET(SERDES_PMA, 0x118, 7, 0, 0x8),
++	PON_SET(SERDES_PMA, 0x204, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x328, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x334, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x328, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x334, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x31c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x318, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x324, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x110, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x108, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x30c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x204, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x328, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x328, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x318, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x110, 8, 8, 0x1),
++	PON_WAIT(200),
++	PON_SET(SERDES_PMA, 0x110, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x318, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x30c, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x894, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x894, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x114, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x10c, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x304, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x304, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x304, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x308, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x308, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x32c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x338, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x084, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x084, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x32c, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x338, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x084, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x084, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x200, 18, 16, 0x2),
++	PON_SET(SERDES_PMA, 0x328, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x334, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x208, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x110, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x108, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x110, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x108, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x328, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x208, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x110, 16, 16, 0x1),
++	PON_WAIT(200),
++	PON_SET(SERDES_PMA, 0x110, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x110, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x084, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x084, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x32c, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x338, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x084, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x084, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x894, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x894, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x114, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x10c, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x308, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x32c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x338, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x144, 7, 0, 0x30),
++	PON_SET(SERDES_PMA, 0x32c, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x338, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x204, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x110, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x108, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x110, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x108, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x32c, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x204, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x110, 24, 24, 0x1),
++	PON_WAIT(200),
++	PON_SET(SERDES_PMA, 0x110, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x110, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x898, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x898, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x840, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x840, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x204, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x32c, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x10c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x338, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x114, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x204, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x32c, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x114, 0, 0, 0x1),
++	PON_WAIT(200),
++	PON_SET(SERDES_PMA, 0x114, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x898, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x898, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x83c, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x83c, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x840, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x840, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x840, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x840, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x114, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x10c, 8, 8, 0x0),
++	PON_WAIT(1),
++	PON_SET(SERDES_PMA, 0x000, 24, 24, 0x1),
++	PON_WAIT(100),
++	PON_SET(SERDES_PMA, 0x460, 11, 11, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 10, 10, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 9, 9, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 7, 7, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 6, 6, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 5, 5, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 4, 4, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 3, 3, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 2, 2, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 1, 1, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 0, 0, 0x0),
++	PON_WAIT(10),
++	PON_SET(SERDES_PMA, 0x460, 11, 11, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 10, 10, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 9, 9, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 7, 7, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 6, 6, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 5, 5, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 4, 4, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 3, 3, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 2, 2, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 1, 1, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x818, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x818, 8, 8, 0x1),
++	PON_WAIT(200),
++};
++
++/*
++ * rx_finish (both): Receiver bring-up after the eye scan (or straight after
++ * rx_trim in GPON): restart the time-to-digital converter, mark the receiver
++ * ready, set the test-pattern block and the receive-to-transmit clock
++ * select.
++ */
++static const struct pon_step seq_rx_finish[] = {
++	PON_SET(SERDES_PMA, 0x040, 9, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x028, 1, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x864, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x794, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x024, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x034, 8, 8, 0x0),
++	PON_WAIT(100),
++	PON_SET(SERDES_PMA, 0x03c, 16, 16, 0x0),
++	PON_WAIT(100),
++	PON_SET(SERDES_PMA, 0x02c, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x010, 0, 0, 0x1),
++	PON_WAIT(5000),
++	PON_SET(SERDES_PMA, 0x114, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x10c, 24, 24, 0x0),
++	PON_WAIT(10),
++	PON_SET(SERDES_PMA, 0x460, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 0, 0, 0x1),
++	PON_WAIT(100),
++	PON_SET(SERDES_PMA, 0x214, 31, 0, 0x8ff1fd53),
++	PON_SET(SERDES_PMA, 0x224, 31, 0, 0xff1fd53),
++	PON_SET(SERDES_PMA, 0x230, 15, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x210, 4, 0, 0x5),
++	PON_SET(SERDES_PMA, 0x220, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x344, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x344, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x414, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x414, 8, 8, 0x0),
++};
++
++/*
++ * rx_hold (both): Light lost: stop the time-to-digital converter and lock
++ * the CDR to the reference.
++ */
++static const struct pon_step seq_rx_hold[] = {
++	PON_SET(SERDES_PMA, 0x034, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x02c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x010, 0, 0, 0x0),
++	PON_WAIT(1000),
++	PON_SET(SERDES_PMA, 0x818, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x818, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x818, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x818, 8, 8, 0x0),
++	PON_WAIT(100),
++};
++
++/*
++ * rx_relock (both): Light back after a full bring-up: pulse the PMA soft
++ * resets, hand the CDR to the data, restart the time-to-digital converter
++ * and the transmit PLL, mark the receiver ready. Traced in XGS-PON only, but
++ * built only from runs that are the same in both modes, so it serves both.
++ */
++static const struct pon_step seq_rx_relock[] = {
++	PON_SET(SERDES_PMA, 0x000, 24, 24, 0x1),
++	PON_WAIT(100),
++	PON_SET(SERDES_PMA, 0x460, 11, 11, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 10, 10, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 9, 9, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 7, 7, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 6, 6, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 5, 5, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 4, 4, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 3, 3, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 2, 2, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 1, 1, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 0, 0, 0x0),
++	PON_WAIT(10),
++	PON_SET(SERDES_PMA, 0x460, 11, 11, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 10, 10, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 9, 9, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 7, 7, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 6, 6, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 5, 5, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 4, 4, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 3, 3, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 2, 2, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 1, 1, 0x1),
++	PON_SET(SERDES_PMA, 0x460, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x818, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x818, 8, 8, 0x1),
++	PON_WAIT(200),
++	PON_SET(SERDES_PMA, 0x040, 9, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x028, 1, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x864, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x794, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x024, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x034, 8, 8, 0x0),
++	PON_WAIT(100),
++	PON_SET(SERDES_PMA, 0x03c, 16, 16, 0x0),
++	PON_WAIT(100),
++	PON_SET(SERDES_PMA, 0x02c, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x010, 0, 0, 0x1),
++	PON_WAIT(5000),
++	PON_SET(SERDES_PMA, 0x854, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x854, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x000, 24, 24, 0x1),
++	PON_WAIT(6),
++	PON_SET(SERDES_ANA, 0x04c, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x854, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x854, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x094, 16, 16, 0x1),
++	PON_SET(SERDES_ANA, 0x094, 8, 8, 0x0),
++	PON_SET(SERDES_ANA, 0x060, 8, 8, 0x1),
++	PON_SET(SERDES_ANA, 0x060, 0, 0, 0x1),
++	PON_SET(SERDES_ANA, 0x04c, 0, 0, 0x0),
++	PON_SET(SERDES_ANA, 0x04c, 24, 24, 0x0),
++	PON_SET(SERDES_ANA, 0x04c, 16, 16, 0x0),
++	PON_WAIT(500),
++	PON_SET(SERDES_PMA, 0x114, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x10c, 24, 24, 0x0),
++	PON_WAIT(10),
++	PON_SET(SERDES_PMA, 0x460, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x460, 0, 0, 0x1),
++	PON_WAIT(100),
++	PON_SET(SERDES_PMA, 0x114, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x10c, 8, 8, 0x0),
++	PON_WAIT(1),
++	PON_SET(SERDES_PMA, 0x414, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x414, 8, 8, 0x0),
++};
++
++/* tx_taps (gpon): Transmit FIR taps and the transmit and receive trims. */
++static const struct pon_step seq_tx_taps_gpon[] = {
++	PON_SET(SERDES_PMA, 0x778, 31, 0, 0x1000100),
++	PON_SET(SERDES_PMA, 0x780, 31, 0, 0x1000100),
++	PON_SET(SERDES_PMA, 0x60c, 1, 0, 0x3),
++	PON_SET(SERDES_PMA, 0x468, 30, 28, 0x1),
++	PON_SET(SERDES_ANA, 0x114, 25, 24, 0x2),
++	PON_SET(SERDES_PMA, 0x264, 25, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x268, 25, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x264, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x268, 16, 16, 0x1),
++};
++
++/* tx_taps (xgspon): Transmit FIR taps and the transmit and receive trims. */
++static const struct pon_step seq_tx_taps_xgspon[] = {
++	PON_SET(SERDES_PMA, 0x778, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x778, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x780, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x780, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x778, 20, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x778, 5, 0, 0x5),
++	PON_SET(SERDES_PMA, 0x780, 4, 0, 0x7),
++	PON_SET(SERDES_PMA, 0x780, 18, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x60c, 1, 0, 0x3),
++	PON_SET(SERDES_PMA, 0x468, 30, 28, 0x1),
++	PON_SET(SERDES_ANA, 0x114, 25, 24, 0x2),
++	PON_SET(SERDES_PMA, 0x264, 25, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x268, 25, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x264, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x268, 16, 16, 0x1),
++};
++
++/* eye_prep (xgspon): XGS-PON eye scan: set the eye-opening monitor up. */
++static const struct pon_step seq_eye_prep_xgspon[] = {
++	PON_SET(SERDES_ANA, 0x0e8, 1, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x080, 31, 24, 0xff),
++	PON_SET(SERDES_PMA, 0x068, 10, 0, 0x1c0),
++	PON_SET(SERDES_PMA, 0x068, 26, 16, 0x240),
++	PON_SET(SERDES_PMA, 0x080, 9, 0, 0xf8),
++	PON_SET(SERDES_PMA, 0x080, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x088, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x06c, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x070, 19, 0, 0xfff8),
++	PON_SET(SERDES_PMA, 0x074, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x074, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x074, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x078, 7, 0, 0x4),
++	PON_SET(SERDES_PMA, 0x078, 15, 8, 0x4),
++	PON_SET(SERDES_PMA, 0x07c, 10, 0, 0x4),
++	PON_SET(SERDES_PMA, 0x07c, 23, 16, 0x4),
++	PON_SET(SERDES_PMA, 0x11c, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x11c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x11c, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x120, 1, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x11c, 24, 24, 0x0),
++};
++
++/*
++ * eye_phase_recal (xgspon): XGS-PON eye scan: redo the phase-interpolator
++ * calibration before one measurement.
++ */
++static const struct pon_step seq_eye_phase_recal_xgspon[] = {
++	PON_SET(SERDES_PMA, 0x784, 22, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x784, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x790, 22, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x790, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x118, 7, 0, 0x80),
++	PON_SET(SERDES_PMA, 0x15c, 10, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x204, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x334, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x328, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x334, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x328, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x324, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x318, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x108, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x110, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x204, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x328, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x328, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x318, 8, 8, 0x1),
++	PON_WAIT(1000),
++	PON_SET(SERDES_PMA, 0x318, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x31c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x30c, 0, 0, 0x1),
++};
++
++/*
++ * eye_start (xgspon): XGS-PON eye scan: restart the eye-opening monitor and
++ * wait for it.
++ */
++static const struct pon_step seq_eye_start_xgspon[] = {
++	PON_SET(SERDES_PMA, 0x080, 9, 0, 0xa),
++	PON_SET(SERDES_PMA, 0x070, 19, 0, 0x44c),
++	PON_SET(SERDES_PMA, 0x33c, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x330, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x330, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x33c, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x330, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x330, 16, 16, 0x1),
++	PON_WAIT(5500),
++	PON_SET(SERDES_PMA, 0x308, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x308, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x084, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x338, 24, 24, 0x1),
++	PON_SET(SERDES_PMA, 0x084, 0, 0, 0x1),
++};
++
++/* eye_stop (xgspon): XGS-PON eye scan: stop the eye-opening monitor. */
++static const struct pon_step seq_eye_stop_xgspon[] = {
++	PON_SET(SERDES_PMA, 0x330, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x33c, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x330, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x31c, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x30c, 0, 0, 0x0),
++};
++
++/*
++ * eye_latch (xgspon): XGS-PON eye scan: latch the monitor readouts before
++ * reading them.
++ */
++static const struct pon_step seq_eye_latch_xgspon[] = {
++	PON_SET(SERDES_PMA, 0x188, 0, 0, 0x1),
++	PON_SET(SERDES_PMA, 0x188, 8, 8, 0x1),
++	PON_SET(SERDES_PMA, 0x188, 16, 16, 0x1),
++	PON_SET(SERDES_PMA, 0x188, 24, 24, 0x1),
++	PON_WAIT(50),
++	PON_SET(SERDES_PMA, 0x188, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x188, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x188, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x188, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x20c, 24, 24, 0x0),
++	PON_WAIT(100),
++	PON_SET(SERDES_PMA, 0x20c, 24, 24, 0x1),
++};
++
++/*
++ * line_leave (gpon): Leaving this line for the other one after a load: put
++ * back the serdes bits only this line writes, to what a load leaves there.
++ */
++static const struct pon_step seq_line_leave_gpon[] = {
++	PON_SET(SERDES_PMA, 0x778, 7, 6, 0x0),
++	PON_SET(SERDES_PMA, 0x778, 15, 9, 0x0),
++	PON_SET(SERDES_PMA, 0x778, 23, 21, 0x0),
++	PON_SET(SERDES_PMA, 0x778, 31, 25, 0x0),
++	PON_SET(SERDES_PMA, 0x780, 7, 5, 0x0),
++	PON_SET(SERDES_PMA, 0x780, 15, 9, 0x0),
++	PON_SET(SERDES_PMA, 0x780, 23, 19, 0x0),
++	PON_SET(SERDES_PMA, 0x780, 31, 25, 0x0),
++};
++
++/*
++ * line_leave (xgspon): Leaving this line for the other one after a load: put
++ * back the serdes bits only this line writes, to what a load leaves there.
++ */
++static const struct pon_step seq_line_leave_xgspon[] = {
++	PON_SET(SERDES_PMA, 0x074, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x074, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x080, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x11c, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x11c, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x11c, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x188, 0, 0, 0x0),
++	PON_SET(SERDES_PMA, 0x188, 8, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x188, 16, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x188, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x20c, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x294, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x300, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x468, 14, 8, 0x0),
++	PON_SET(SERDES_PMA, 0x784, 22, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x784, 24, 24, 0x0),
++	PON_SET(SERDES_PMA, 0x790, 22, 16, 0x0),
++	PON_SET(SERDES_PMA, 0x790, 24, 24, 0x0),
++};
++
++const struct pon_seq pon_seqs[PON_SEQ_COUNT][PON_LINES] = {
++	[PON_SEQ_SERDES_PREP] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_serdes_prep, ARRAY_SIZE(seq_serdes_prep)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_serdes_prep, ARRAY_SIZE(seq_serdes_prep)
++		},
++	},
++	[PON_SEQ_TXPLL_SETUP] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_txpll_setup, ARRAY_SIZE(seq_txpll_setup)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_txpll_setup, ARRAY_SIZE(seq_txpll_setup)
++		},
++	},
++	[PON_SEQ_TX_RATE] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_tx_rate_gpon, ARRAY_SIZE(seq_tx_rate_gpon)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_tx_rate_xgspon, ARRAY_SIZE(seq_tx_rate_xgspon)
++		},
++	},
++	[PON_SEQ_SERDES_COMMON_MID] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_serdes_common_mid, ARRAY_SIZE(seq_serdes_common_mid)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_serdes_common_mid, ARRAY_SIZE(seq_serdes_common_mid)
++		},
++	},
++	[PON_SEQ_RX_RATE] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_rx_rate_gpon, ARRAY_SIZE(seq_rx_rate_gpon)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_rx_rate_xgspon, ARRAY_SIZE(seq_rx_rate_xgspon)
++		},
++	},
++	[PON_SEQ_ANALOG_RATE] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_analog_rate_gpon, ARRAY_SIZE(seq_analog_rate_gpon)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_analog_rate_xgspon, ARRAY_SIZE(seq_analog_rate_xgspon)
++		},
++	},
++	[PON_SEQ_SERDES_COMMON_TAIL] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_serdes_common_tail, ARRAY_SIZE(seq_serdes_common_tail)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_serdes_common_tail, ARRAY_SIZE(seq_serdes_common_tail)
++		},
++	},
++	[PON_SEQ_CLOCKS_UP] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_clocks_up, ARRAY_SIZE(seq_clocks_up)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_clocks_up, ARRAY_SIZE(seq_clocks_up)
++		},
++	},
++	[PON_SEQ_RX_START] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_rx_start, ARRAY_SIZE(seq_rx_start)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_rx_start, ARRAY_SIZE(seq_rx_start)
++		},
++	},
++	[PON_SEQ_RX_TRIM] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_rx_trim, ARRAY_SIZE(seq_rx_trim)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_rx_trim, ARRAY_SIZE(seq_rx_trim)
++		},
++	},
++	[PON_SEQ_RX_FINISH] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_rx_finish, ARRAY_SIZE(seq_rx_finish)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_rx_finish, ARRAY_SIZE(seq_rx_finish)
++		},
++	},
++	[PON_SEQ_RX_HOLD] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_rx_hold, ARRAY_SIZE(seq_rx_hold)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_rx_hold, ARRAY_SIZE(seq_rx_hold)
++		},
++	},
++	[PON_SEQ_RX_RELOCK] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_rx_relock, ARRAY_SIZE(seq_rx_relock)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_rx_relock, ARRAY_SIZE(seq_rx_relock)
++		},
++	},
++	[PON_SEQ_TX_TAPS] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_tx_taps_gpon, ARRAY_SIZE(seq_tx_taps_gpon)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_tx_taps_xgspon, ARRAY_SIZE(seq_tx_taps_xgspon)
++		},
++	},
++	[PON_SEQ_EYE_PREP] = {
++		[PON_LINE_IDX_GPON] = { },
++		[PON_LINE_IDX_XGSPON] = {
++			seq_eye_prep_xgspon, ARRAY_SIZE(seq_eye_prep_xgspon)
++		},
++	},
++	[PON_SEQ_EYE_PHASE_RECAL] = {
++		[PON_LINE_IDX_GPON] = { },
++		[PON_LINE_IDX_XGSPON] = {
++			seq_eye_phase_recal_xgspon, ARRAY_SIZE(seq_eye_phase_recal_xgspon)
++		},
++	},
++	[PON_SEQ_EYE_START] = {
++		[PON_LINE_IDX_GPON] = { },
++		[PON_LINE_IDX_XGSPON] = {
++			seq_eye_start_xgspon, ARRAY_SIZE(seq_eye_start_xgspon)
++		},
++	},
++	[PON_SEQ_EYE_STOP] = {
++		[PON_LINE_IDX_GPON] = { },
++		[PON_LINE_IDX_XGSPON] = {
++			seq_eye_stop_xgspon, ARRAY_SIZE(seq_eye_stop_xgspon)
++		},
++	},
++	[PON_SEQ_EYE_LATCH] = {
++		[PON_LINE_IDX_GPON] = { },
++		[PON_LINE_IDX_XGSPON] = {
++			seq_eye_latch_xgspon, ARRAY_SIZE(seq_eye_latch_xgspon)
++		},
++	},
++	[PON_SEQ_LINE_LEAVE] = {
++		[PON_LINE_IDX_GPON] = {
++			seq_line_leave_gpon, ARRAY_SIZE(seq_line_leave_gpon)
++		},
++		[PON_LINE_IDX_XGSPON] = {
++			seq_line_leave_xgspon, ARRAY_SIZE(seq_line_leave_xgspon)
++		},
++	},
++};
+diff --git a/drivers/phy/airoha/phy-en7581-pon-seq.h b/drivers/phy/airoha/phy-en7581-pon-seq.h
+new file mode 100644
+index 0000000..26b29fd
+--- /dev/null
++++ b/drivers/phy/airoha/phy-en7581-pon-seq.h
+@@ -0,0 +1,36 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * EN7581 PON PHY: the names of the fixed serdes write sequences.
++ *
++ * Register sequence definitions. These C tables are the editable source
++ * for the contributed driver; no external sequence specification is required.
++ */
++
++#ifndef _PHY_EN7581_PON_SEQ_H
++#define _PHY_EN7581_PON_SEQ_H
++
++enum pon_seq_id {
++	PON_SEQ_SERDES_PREP,
++	PON_SEQ_TXPLL_SETUP,
++	PON_SEQ_TX_RATE,
++	PON_SEQ_SERDES_COMMON_MID,
++	PON_SEQ_RX_RATE,
++	PON_SEQ_ANALOG_RATE,
++	PON_SEQ_SERDES_COMMON_TAIL,
++	PON_SEQ_CLOCKS_UP,
++	PON_SEQ_RX_START,
++	PON_SEQ_RX_TRIM,
++	PON_SEQ_RX_FINISH,
++	PON_SEQ_RX_HOLD,
++	PON_SEQ_RX_RELOCK,
++	PON_SEQ_TX_TAPS,
++	PON_SEQ_EYE_PREP,
++	PON_SEQ_EYE_PHASE_RECAL,
++	PON_SEQ_EYE_START,
++	PON_SEQ_EYE_STOP,
++	PON_SEQ_EYE_LATCH,
++	PON_SEQ_LINE_LEAVE,
++	PON_SEQ_COUNT,
++};
++
++#endif /* _PHY_EN7581_PON_SEQ_H */
+diff --git a/drivers/phy/airoha/phy-en7581-pon.h b/drivers/phy/airoha/phy-en7581-pon.h
+new file mode 100644
+index 0000000..ef57788
+--- /dev/null
++++ b/drivers/phy/airoha/phy-en7581-pon.h
+@@ -0,0 +1,64 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * EN7581 PON PHY: what the core and its generated sequence tables share.
++ */
++
++#ifndef _PHY_EN7581_PON_H
++#define _PHY_EN7581_PON_H
++
++#include <linux/array_size.h>
++#include <linux/types.h>
++
++#include "phy-en7581-pon-seq.h"
++
++/*
++ * The serdes is one 8 KiB register window: the analog half at its start and
++ * the PMA half 4 KiB in. A table step names its register by its offset in
++ * that window.
++ */
++#define SERDES_ANA		0x0000
++#define SERDES_PMA		0x1000
++
++/* A step whose register is this is a pause; its value is in microseconds. */
++#define PON_STEP_PAUSE		0xffff
++
++/* Columns of the sequence index, one per line mode. */
++#define PON_LINE_IDX_GPON	0
++#define PON_LINE_IDX_XGSPON	1
++#define PON_LINES		2
++
++/**
++ * struct pon_step - one step of a fixed serdes sequence
++ * @reg: register offset in the serdes window, or PON_STEP_PAUSE
++ * @hi: top bit written
++ * @lo: bottom bit written
++ * @val: what goes into bits @hi..@lo, or the pause in microseconds
++ *
++ * A field step reads the register, replaces bits @hi..@lo with @val and
++ * writes the word back, also when the field already held @val.
++ */
++struct pon_step {
++	u16 reg;
++	u8 hi;
++	u8 lo;
++	u32 val;
++};
++
++#define PON_SET(win, off, h, l, v) \
++	{ .reg = (win) + (off), .hi = (h), .lo = (l), .val = (v) }
++#define PON_WAIT(us) \
++	{ .reg = PON_STEP_PAUSE, .val = (us) }
++
++/**
++ * struct pon_seq - a fixed serdes sequence for one line mode
++ * @steps: the steps, in order
++ * @len: how many there are; 0 when the mode has no such sequence
++ */
++struct pon_seq {
++	const struct pon_step *steps;
++	unsigned int len;
++};
++
++extern const struct pon_seq pon_seqs[PON_SEQ_COUNT][PON_LINES];
++
++#endif /* _PHY_EN7581_PON_H */
+diff --git a/include/linux/phy/en7581-pon.h b/include/linux/phy/en7581-pon.h
+new file mode 100644
+index 0000000..9bbe481
+--- /dev/null
++++ b/include/linux/phy/en7581-pon.h
+@@ -0,0 +1,207 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++/*
++ * Airoha EN7581 PON PHY: the operations a PON MAC driver needs beyond the
++ * generic PHY API.
++ *
++ * The MAC selects the line mode with phy_set_mode_ext(phy, PHY_MODE_ETHERNET,
++ * EN7581_PON_GPON or EN7581_PON_XGSPON) once phy_init() has run, ahead of
++ * phy_power_on(). The first selection programs the PHY, which then stays
++ * programmed across power-off and power-on; a later one does nothing, so a
++ * new line mode takes phy_exit() and phy_init(). phy_reset() resets and
++ * reprograms the whole PHY and leaves it powered on. Everything else is here.
++ *
++ * Context: unless a function says it sleeps, it only touches registers (or the
++ * optical module's transmit-disable line) and may be called from any context,
++ * including hard interrupt context. Every function needs the PHY powered on
++ * and returns -ENODEV when it is not, except en7581_pon_phy_link(), which then
++ * reports no light, en7581_pon_phy_set_transmitter() and
++ * en7581_pon_phy_watch_events().
++ */
++
++#ifndef __LINUX_PHY_EN7581_PON_H
++#define __LINUX_PHY_EN7581_PON_H
++
++#include <linux/bits.h>
++#include <linux/types.h>
++
++struct phy;
++
++/* Line modes, the submode of PHY_MODE_ETHERNET for phy_set_mode_ext() */
++enum en7581_pon_line {
++	EN7581_PON_GPON = 1,
++	EN7581_PON_XGSPON,
++};
++
++/* Counter groups for en7581_pon_phy_restart_counters() */
++#define EN7581_PON_CNT_FEC	BIT(0)
++#define EN7581_PON_CNT_BIP	BIT(1)
++#define EN7581_PON_CNT_FRAMES	BIT(2)
++#define EN7581_PON_CNT_ALL	(EN7581_PON_CNT_FEC | EN7581_PON_CNT_BIP | \
++				 EN7581_PON_CNT_FRAMES)
++
++/**
++ * struct en7581_pon_fec_stats - downstream FEC counters
++ * @corrected_bytes: bytes the decoder corrected
++ * @corrected_words: codewords the decoder corrected
++ * @uncorrectable_words: codewords it could not correct
++ * @total_words: codewords received
++ * @errored_seconds: seconds that saw an uncorrectable codeword
++ */
++struct en7581_pon_fec_stats {
++	u32 corrected_bytes;
++	u32 corrected_words;
++	u32 uncorrectable_words;
++	u32 total_words;
++	u32 errored_seconds;
++};
++
++/**
++ * struct en7581_pon_frame_stats - downstream frame counters
++ * @frames: frames received (32 bits wide in XGS-PON)
++ * @lof: loss-of-frame count
++ */
++struct en7581_pon_frame_stats {
++	u64 frames;
++	u32 lof;
++};
++
++/* Downstream FEC decoding, en7581_pon_phy_set_fec_decode() */
++enum en7581_pon_fec_decode {
++	EN7581_PON_FEC_DECODE_OFF,
++	EN7581_PON_FEC_DECODE_ON,
++	/* decode when the OLT announces FEC; XGS-PON only */
++	EN7581_PON_FEC_DECODE_AUTO,
++};
++
++/**
++ * struct en7581_pon_gpon_overhead - GPON upstream burst overhead
++ * @guard_time: guard time, in bits
++ * @type1_bits: type 1 preamble length, in bits
++ * @type2_bits: type 2 preamble length, in bits
++ * @type3_pattern: the type 3 preamble pattern byte
++ * @delimiter: the three burst delimiter bytes, in transmit order
++ *
++ * The fields of the Upstream_Overhead PLOAM message (ITU-T G.984.3).
++ */
++struct en7581_pon_gpon_overhead {
++	u8 guard_time;
++	u8 type1_bits;
++	u8 type2_bits;
++	u8 type3_pattern;
++	u8 delimiter[3];
++};
++
++/* GPON ONU activation states the burst logic needs (ITU-T G.984.3) */
++enum en7581_pon_onu_state {
++	EN7581_PON_ONU_STANDBY,		/* O2 */
++	EN7581_PON_ONU_RANGING,		/* O3, O4 */
++	EN7581_PON_ONU_OPERATION,	/* O5 */
++};
++
++/**
++ * struct en7581_pon_burst_profile - one XGS-PON upstream burst profile
++ * @preamble: the 8 preamble bytes, in transmit order
++ * @delimiter: the 8 delimiter bytes, in transmit order
++ * @delimiter_len: delimiter length, as the Burst_Profile message carries it
++ * @preamble_len: preamble length, as the message carries it
++ * @preamble_repeat: preamble repeat count, as the message carries it
++ * @fec: upstream FEC on for bursts that use this profile
++ *
++ * The fields of the Burst_Profile PLOAM message (ITU-T G.9807.1).
++ */
++struct en7581_pon_burst_profile {
++	u8 preamble[8];
++	u8 delimiter[8];
++	u8 delimiter_len;
++	u8 preamble_len;
++	u8 preamble_repeat;
++	bool fec;
++};
++
++/* Polarity sets for en7581_pon_phy_set_polarity() */
++#define EN7581_PON_POL_TX	BIT(0)	/* the three transmit-side signals */
++#define EN7581_PON_POL_RX	BIT(1)	/* receive signal-detect */
++#define EN7581_PON_POL_ALL	(EN7581_PON_POL_TX | EN7581_PON_POL_RX)
++
++/**
++ * struct en7581_pon_polarity - which optic signals the PHY inverts
++ * @invert_tx_detect: the transmit signal-detect input
++ * @invert_burst_enable: the burst-enable output
++ * @invert_tx_fault: the transmit-fault input
++ * @invert_rx_detect: the receive signal-detect input, so that it reports
++ *	loss of light rather than light
++ *
++ * The first three form the EN7581_PON_POL_TX set and are always set
++ * together; @invert_rx_detect alone is the EN7581_PON_POL_RX set.
++ */
++struct en7581_pon_polarity {
++	bool invert_tx_detect;
++	bool invert_burst_enable;
++	bool invert_tx_fault;
++	bool invert_rx_detect;
++};
++
++/* What the PHY concluded about the downstream link */
++enum en7581_pon_link_report {
++	EN7581_PON_REPORT_READY,	/* synchronised, with light */
++	EN7581_PON_REPORT_LOST,		/* sync or light gone */
++	EN7581_PON_REPORT_FRAME_LOST,	/* XGS-PON: downstream framing lost */
++};
++
++/**
++ * typedef en7581_pon_link_fn - a link report from the PHY
++ * @data: the pointer given to en7581_pon_phy_set_link_handler()
++ * @report: what the PHY concluded
++ * @polled: true when the PHY's periodic link check made the report for
++ *	itself; false when a latched link event led to it, and on the lost
++ *	report XGS-PON sends ahead of a ready one after an unexpected event
++ *
++ * GPON reports on every periodic check and XGS-PON only when the link
++ * changes; both also report the link events they act on. Runs in process
++ * context with the PHY's state locked: it must not call the functions below
++ * that sleep.
++ */
++typedef void (*en7581_pon_link_fn)(void *data,
++				   enum en7581_pon_link_report report,
++				   bool polled);
++
++int en7581_pon_phy_set_link_handler(struct phy *phy, en7581_pon_link_fn fn,
++				    void *data);
++int en7581_pon_phy_watch_events(struct phy *phy, bool on);
++int en7581_pon_phy_link(struct phy *phy, bool *ready, bool *light);
++int en7581_pon_phy_restart_counters(struct phy *phy, unsigned int groups);
++int en7581_pon_phy_bip_errors(struct phy *phy, u32 *errors);
++int en7581_pon_phy_fec_stats(struct phy *phy, struct en7581_pon_fec_stats *st);
++int en7581_pon_phy_frame_stats(struct phy *phy,
++			       struct en7581_pon_frame_stats *st);
++int en7581_pon_phy_fec_in_use(struct phy *phy, bool *down, bool *up);
++int en7581_pon_phy_get_fec_decode(struct phy *phy, bool *on);
++int en7581_pon_phy_set_fec_decode(struct phy *phy,
++				  enum en7581_pon_fec_decode mode);
++int en7581_pon_phy_rtt(struct phy *phy, u32 *rtt);
++int en7581_pon_phy_set_gpon_overhead(struct phy *phy,
++				     const struct en7581_pon_gpon_overhead *oh);
++int en7581_pon_phy_set_onu_state(struct phy *phy,
++				 enum en7581_pon_onu_state state);
++int en7581_pon_phy_set_extended_burst(struct phy *phy, u8 ranging_bytes,
++				      u8 operation_bytes);
++int en7581_pon_phy_set_bit_delay(struct phy *phy, unsigned int bits);
++int en7581_pon_phy_set_serdes_usable(struct phy *phy, bool usable);
++int en7581_pon_phy_logic_reset(struct phy *phy);
++int en7581_pon_phy_set_burst_profile(struct phy *phy, unsigned int n,
++				     const struct en7581_pon_burst_profile *bp);
++int en7581_pon_phy_get_burst_profile(struct phy *phy, unsigned int n,
++				     struct en7581_pon_burst_profile *bp);
++int en7581_pon_phy_set_receiver(struct phy *phy, bool on);
++int en7581_pon_phy_set_transmitter(struct phy *phy, bool on);
++int en7581_pon_phy_set_polarity(struct phy *phy,
++				const struct en7581_pon_polarity *pol,
++				unsigned int sets);
++int en7581_pon_phy_get_polarity(struct phy *phy,
++				struct en7581_pon_polarity *pol);
++int en7581_pon_phy_set_continuous_tx(struct phy *phy, bool on);
++int en7581_pon_phy_get_continuous_tx(struct phy *phy, bool *on);
++int en7581_pon_phy_set_test_pattern(struct phy *phy, bool on,
++				    unsigned int pattern, bool in_grants);
++
++#endif /* __LINUX_PHY_EN7581_PON_H */
