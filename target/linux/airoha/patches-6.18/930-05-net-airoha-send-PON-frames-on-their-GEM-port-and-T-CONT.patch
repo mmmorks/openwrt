@@ -1,0 +1,346 @@
+From: John Morkel <john@morkel.me>
+Date: Thu, 8 Oct 2026 23:04:00 -0700
+Subject: [PATCH] net: airoha: send PON frames on their GEM port and T-CONT
+
+On a PON port every upstream frame names its GEM port and T-CONT in the
+TX message words: the GEM port ID in the special tag field, the T-CONT
+in the channel field and again in the next-hop queue field, and port 2
+as the forwarding port. Neither a meter nor an account group applies
+unless one is bound.
+
+For a data frame the GEM port comes from the first classification rule
+that matches the frame's outer VLAN ID and PCP (an untagged frame has
+PCP 0), and the T-CONT and the queue of that T-CONT from that GEM port's
+table entry. The OLT binds each upstream GEM port to one queue of its
+T-CONT (G.988 managed entity 268, attribute 4), so the queue is the
+GEM port's and not the frame's priority. The frame goes on the TX ring
+of that queue, and the queue field names it too. A frame is dropped
+when no rule matches, when its GEM port carries no upstream traffic,
+when its T-CONT is not open, or while the carrier is off.
+
+The PON MAC driver sends control (OMCI) frames with
+airoha_pon_xmit_ctrl(): channel 0, queue 7, the control flag, the no-drop
+bit, and on XGS-PON the integrity key index. They use their own TX ring,
+the one after the eight data rings, and the driver's ctrl_tx_wake()
+callback runs when that ring has room again after it filled up.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 5329411..f659237 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -1183,6 +1183,9 @@ static void airoha_qdma_wake_netdev_txqs(struct airoha_queue *q)
+ 
+ 				netif_wake_subqueue(netdev, j);
+ 			}
++
++			if (dev->pon && qid == AIROHA_PON_CTRL_RING)
++				airoha_pon_ctrl_tx_wake(dev->pon);
+ 		}
+ 	}
+ 	q->txq_stopped = false;
+@@ -2542,6 +2545,10 @@ static u16 airoha_dev_select_queue(struct net_device *netdev,
+ 	struct airoha_gdm_port *port = dev->port;
+ 	int queue, channel;
+ 
++	/* On a PON port the queue is the frame's GEM port's */
++	if (dev->pon)
++		return airoha_pon_select_queue(dev->pon, skb);
++
+ 	/* For dsa device select QoS channel according to the dsa user port
+ 	 * index, rely on port id otherwise. Select QoS queue based on the
+ 	 * skb priority.
+@@ -2632,10 +2639,9 @@ static int airoha_dev_set_features(struct net_device *netdev,
+ 	return 0;
+ }
+ 
+-static netdev_tx_t airoha_qdma_tx_skb(struct airoha_qdma *qdma,
+-				      struct sk_buff *skb,
+-				      struct net_device *netdev, int qid,
+-				      u32 msg0, u32 msg1, bool more)
++netdev_tx_t airoha_qdma_tx_skb(struct airoha_qdma *qdma, struct sk_buff *skb,
++			       struct net_device *netdev, int qid, u32 msg0,
++			       u32 msg1, bool more)
+ {
+ 	struct airoha_queue_entry *e;
+ 	struct netdev_queue *txq;
+@@ -2789,6 +2795,9 @@ static netdev_tx_t airoha_dev_xmit(struct sk_buff *skb,
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, fport) |
+ 	       FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f);
+ 
++	if (dev->pon && airoha_pon_tx_msg(dev->pon, skb, &msg0, &msg1))
++		goto error;
++
+ 	ret = airoha_qdma_tx_skb(qdma, skb, netdev, qid, msg0, msg1,
+ 				 netdev_xmit_more());
+ 	rcu_read_unlock();
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index c13d41d..d5426a1 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -35,6 +35,10 @@
+ #define AIROHA_FE_MC_MAX_VLAN_TABLE	64
+ #define AIROHA_FE_MC_MAX_VLAN_PORT	16
+ #define AIROHA_NUM_TX_IRQ		2
++/* a PON port's data frames use the TX rings of their GEM port's queue
++ * (0-7), its control frames the ring after them
++ */
++#define AIROHA_PON_CTRL_RING		AIROHA_NUM_QOS_QUEUES
+ #define AIROHA_RX_HEADROOM		(NET_SKB_PAD + NET_IP_ALIGN)
+ #define AIROHA_RX_LEN(_n)		((_n) - AIROHA_RX_HEADROOM)
+ #define HW_DSCP_NUM			2048
+@@ -794,11 +798,19 @@ int airoha_qdma_set_chan_tx_sched(struct airoha_qdma *qdma, int channel,
+ int airoha_qdma_set_chan_rate_limit(struct airoha_qdma *qdma, int channel,
+ 				    u32 rate, u32 bucket_size);
+ 
++netdev_tx_t airoha_qdma_tx_skb(struct airoha_qdma *qdma, struct sk_buff *skb,
++			       struct net_device *netdev, int qid, u32 msg0,
++			       u32 msg1, bool more);
++
+ int airoha_pon_alloc(struct airoha_gdm_dev *dev);
+ int airoha_pon_init(struct airoha_gdm_dev *dev);
+ void airoha_pon_start(struct airoha_pon *pon);
+ void airoha_pon_stop(struct airoha_pon *pon);
+ void airoha_pon_free(struct airoha_pon *pon);
++u16 airoha_pon_select_queue(struct airoha_pon *pon, struct sk_buff *skb);
++int airoha_pon_tx_msg(struct airoha_pon *pon, struct sk_buff *skb, u32 *msg0,
++		      u32 *msg1);
++void airoha_pon_ctrl_tx_wake(struct airoha_pon *pon);
+ 
+ void airoha_ppe_set_xmit_frame_size(struct airoha_gdm_dev *dev);
+ void airoha_ppe_set_cpu_port(struct airoha_gdm_dev *dev, u8 ppe_id, u8 fport);
+diff --git a/drivers/net/ethernet/airoha/airoha_pon.c b/drivers/net/ethernet/airoha/airoha_pon.c
+index b9a808a..1095cbd 100644
+--- a/drivers/net/ethernet/airoha/airoha_pon.c
++++ b/drivers/net/ethernet/airoha/airoha_pon.c
+@@ -3,6 +3,7 @@
+  * PON mode of a GMAC port: the port carries the SoC's PON MAC, and a PON
+  * MAC driver tells the frame engine which GEM ports and T-CONTs exist.
+  */
++#include <linux/bsearch.h>
+ #include <linux/if_vlan.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -18,6 +19,13 @@
+ #define AIROHA_PON_MIN_FRAME_LEN	60
+ /* GDM2 RX channels the PON MAC delivers on */
+ #define AIROHA_PON_RX_CHANS		GENMASK(1, 0)
++/* control frames leave on T-CONT channel 0, in its highest queue */
++#define AIROHA_PON_CTRL_QUEUE		7
++/* no meter, and neither account group counts the frame */
++#define AIROHA_PON_TX_MSG1_NONE					\
++	(FIELD_PREP(QDMA_ETH_TXMSG_METER_MASK, 0x7f) |		\
++	 FIELD_PREP(QDMA_ETH_TXMSG_ACNT_G0_MASK, 0x3f) |	\
++	 FIELD_PREP(QDMA_ETH_TXMSG_ACNT_G1_MASK, 0x1f))
+ 
+ struct airoha_pon_client {
+ 	const struct airoha_pon_ops *ops;
+@@ -618,6 +626,175 @@ int airoha_pon_tcont_counters(struct airoha_pon *pon, unsigned int tcont,
+ }
+ EXPORT_SYMBOL_GPL(airoha_pon_tcont_counters);
+ 
++static const struct airoha_pon_gem *
++airoha_pon_find_gem(const struct airoha_pon_map *map, u16 port_id)
++{
++	struct airoha_pon_gem key = { .port_id = port_id };
++
++	return bsearch(&key, map->gems, map->num_gems, sizeof(key),
++		       airoha_pon_gem_cmp);
++}
++
++/* The GEM port entry of an upstream frame, with an open T-CONT; call it
++ * under RCU.
++ */
++static int airoha_pon_resolve(struct airoha_pon *pon, u16 vid, u8 pcp,
++			      struct airoha_pon_gem *out)
++{
++	const struct airoha_pon_gem *gem = NULL;
++	const struct airoha_pon_map *map;
++	unsigned int i;
++
++	map = rcu_dereference(pon->map);
++	if (!map)
++		return -ENOENT;
++
++	for (i = 0; i < map->num_rules; i++) {
++		const struct airoha_pon_rule *rule = &map->rules[i];
++
++		if (rule->vid != AIROHA_PON_VID_ANY && rule->vid != vid)
++			continue;
++
++		if (rule->pcp != AIROHA_PON_PCP_ANY && rule->pcp != pcp)
++			continue;
++
++		gem = airoha_pon_find_gem(map, rule->port_id);
++		break;
++	}
++
++	if (!gem || !(gem->flags & AIROHA_PON_GEM_UPSTREAM))
++		return -ENOENT;
++
++	if (!test_bit(gem->tcont, pon->tconts))
++		return -ENOLINK;
++
++	*out = *gem;
++
++	return 0;
++}
++
++/* The GEM port entry of an upstream data frame, from its outer tag;
++ * call it under RCU.
++ */
++static int airoha_pon_resolve_skb(struct airoha_pon *pon, struct sk_buff *skb,
++				  struct airoha_pon_gem *gem)
++{
++	u16 tci, vid = AIROHA_PON_VID_UNTAGGED;
++	u8 pcp = 0;
++
++	if (!vlan_get_tag(skb, &tci)) {
++		vid = tci & VLAN_VID_MASK;
++		pcp = (tci & VLAN_PRIO_MASK) >> VLAN_PRIO_SHIFT;
++	}
++
++	return airoha_pon_resolve(pon, vid, pcp, gem);
++}
++
++/* The TX ring of an upstream data frame: the one of its GEM port's queue,
++ * so that a full ring holds back only the frames of one queue. A frame
++ * that maps to no GEM port goes on ring 0, and airoha_pon_tx_msg() drops
++ * it.
++ */
++u16 airoha_pon_select_queue(struct airoha_pon *pon, struct sk_buff *skb)
++{
++	struct airoha_pon_gem gem;
++	int err;
++
++	rcu_read_lock();
++	err = airoha_pon_resolve_skb(pon, skb, &gem);
++	rcu_read_unlock();
++
++	return err ? 0 : gem.queue;
++}
++
++/* Fill the GEM port, T-CONT and queue of an upstream data frame into its
++ * TX message words; an error means the frame must be dropped. Called under
++ * RCU.
++ */
++int airoha_pon_tx_msg(struct airoha_pon *pon, struct sk_buff *skb, u32 *msg0,
++		      u32 *msg1)
++{
++	struct airoha_pon_gem gem;
++	int err;
++
++	if (!netif_carrier_ok(netdev_from_priv(pon->dev)))
++		return -ENOLINK;
++
++	err = airoha_pon_resolve_skb(pon, skb, &gem);
++	if (err)
++		return err;
++
++	*msg0 &= ~(QDMA_ETH_TXMSG_CHAN_MASK | QDMA_ETH_TXMSG_QUEUE_MASK |
++		   QDMA_ETH_TXMSG_SP_TAG_MASK);
++	*msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK, gem.tcont) |
++		 FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK, gem.queue) |
++		 FIELD_PREP(QDMA_ETH_TXMSG_SP_TAG_MASK, gem.port_id);
++	*msg1 = FIELD_PREP(QDMA_ETH_TXMSG_NBOQ_MASK, gem.tcont) |
++		FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, AIROHA_GDM2_IDX) |
++		AIROHA_PON_TX_MSG1_NONE;
++
++	return 0;
++}
++
++void airoha_pon_ctrl_tx_wake(struct airoha_pon *pon)
++{
++	struct airoha_pon_client *client;
++
++	rcu_read_lock();
++	client = rcu_dereference(pon->client);
++	if (client && client->ops->ctrl_tx_wake)
++		client->ops->ctrl_tx_wake(client->priv);
++	rcu_read_unlock();
++}
++
++/**
++ * airoha_pon_xmit_ctrl() - send a control (OMCI) frame
++ * @pon: the interface
++ * @skb: the frame, as the GEM port carries it
++ * @port_id: the GEM port of the OMCC
++ * @flags: AIROHA_PON_TX_MIC_KEY1 or 0
++ *
++ * The frame is never dropped for QDMA congestion. On success the frame
++ * belongs to the frame engine driver, even when it then has to drop it; on
++ * any error it is still the caller's.
++ *
++ * Return: 0; -EBUSY when the control ring is full, and ctrl_tx_wake()
++ * follows; -ENETDOWN while the port is down; -EINVAL.
++ */
++int airoha_pon_xmit_ctrl(struct airoha_pon *pon, struct sk_buff *skb,
++			 u16 port_id, u32 flags)
++{
++	struct net_device *netdev = netdev_from_priv(pon->dev);
++	netdev_tx_t ret;
++	u32 msg0, msg1;
++
++	if (flags & ~AIROHA_PON_TX_MIC_KEY1)
++		return -EINVAL;
++
++	if (!netif_running(netdev))
++		return -ENETDOWN;
++
++	msg0 = FIELD_PREP(QDMA_ETH_TXMSG_SP_TAG_MASK, port_id) |
++	       FIELD_PREP(QDMA_ETH_TXMSG_QUEUE_MASK, AIROHA_PON_CTRL_QUEUE) |
++	       QDMA_ETH_TXMSG_OAM_MASK;
++	if (flags & AIROHA_PON_TX_MIC_KEY1)
++		msg0 |= QDMA_ETH_TXMSG_MIC_IDX_MASK;
++	msg1 = QDMA_ETH_TXMSG_NO_DROP |
++	       FIELD_PREP(QDMA_ETH_TXMSG_FPORT_MASK, AIROHA_GDM2_IDX) |
++	       AIROHA_PON_TX_MSG1_NONE;
++
++	skb->dev = netdev;
++	skb_set_queue_mapping(skb, AIROHA_PON_CTRL_RING);
++
++	local_bh_disable();
++	ret = airoha_qdma_tx_skb(pon->qdma, skb, netdev, AIROHA_PON_CTRL_RING,
++				 msg0, msg1, false);
++	local_bh_enable();
++
++	return ret == NETDEV_TX_BUSY ? -EBUSY : 0;
++}
++EXPORT_SYMBOL_GPL(airoha_pon_xmit_ctrl);
++
+ /**
+  * airoha_pon_set_carrier() - report whether the PON link carries traffic
+  * @pon: the interface
+diff --git a/include/linux/soc/airoha/airoha_pon.h b/include/linux/soc/airoha/airoha_pon.h
+index 61a4c71..62fda72 100644
+--- a/include/linux/soc/airoha/airoha_pon.h
++++ b/include/linux/soc/airoha/airoha_pon.h
+@@ -55,7 +55,7 @@ struct airoha_pon_gem {
+ /**
+  * struct airoha_pon_rule - one upstream classification rule
+  * @vid: the VLAN ID of the frame's outer tag, AIROHA_PON_VID_UNTAGGED to
+- *	match a frame without a tag, or AIROHA_PON_VID_ANY
++ *	match a frame without a tag, or AIROHA_PON_VID_ANY to match any frame
+  * @pcp: the priority code point of the outer tag, 0 to 7, or
+  *	AIROHA_PON_PCP_ANY. A frame without a tag has PCP 0.
+  * @port_id: the GEM port a matching frame is sent on
+@@ -94,6 +94,9 @@ struct airoha_pon_ops {
+ 
+ #define AIROHA_PON_RX_MIC_UNCHECKED	BIT(0)
+ 
++/* airoha_pon_xmit_ctrl(): integrity key 1 instead of key 0 (XGS-PON) */
++#define AIROHA_PON_TX_MIC_KEY1		BIT(0)
++
+ #if IS_ENABLED(CONFIG_NET_AIROHA)
+ struct airoha_pon *airoha_pon_get(struct device *consumer,
+ 				  struct device_node *np);
+@@ -116,6 +119,8 @@ int airoha_pon_tcont_rate(struct airoha_pon *pon, unsigned int tcont,
+ int airoha_pon_tcont_counters(struct airoha_pon *pon, unsigned int tcont,
+ 			      u32 *cpu_packets, u32 *fwd_packets);
+ void airoha_pon_set_carrier(struct airoha_pon *pon, bool up);
++int airoha_pon_xmit_ctrl(struct airoha_pon *pon, struct sk_buff *skb,
++			 u16 port_id, u32 flags);
+ #else
+ static inline struct airoha_pon *airoha_pon_get(struct device *consumer,
+ 						struct device_node *np)
