@@ -1,0 +1,355 @@
+From: John Morkel <john@morkel.me>
+Date: Fri, 9 Oct 2026 10:00:00 -0700
+Subject: [PATCH] net: airoha: retire a PON T-CONT's channel when it closes
+
+When the OLT withdraws a T-CONT, closing its queues leaves the frames
+GDM2 already holds for its channel where they are. Have GDM2 give them
+up: release its TX and RX hold unless that drops within a few reads,
+then start a release of the channel with only that channel enabled, and
+wait in 1 ms steps, about 10 ms at most, until the release is done, GDM2
+holds no frame for the channel and its queues are empty. A timeout goes
+back to the caller; the T-CONT is closed either way.
+
+airoha_pon_retire_all() does the same for all 32 channels, for a PON MAC
+that starts over (a GPON serial number refused or an ONU reset, an
+XGS-PON reset-control change). It refuses every frame sent on the port
+while it runs, opens every queue, turns GDM2's channels off, retires
+each channel, waits for the RX channels to empty, and puts the channel
+enables and the queues back as they were.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 5202e76..f1b8665 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -652,6 +652,8 @@ struct airoha_pon {
+ 	/* GDM2 TX channels to enable while the port runs */
+ 	u32 tx_chans;
+ 	bool running;
++	/* set while airoha_pon_retire_all() runs: refuse every frame */
++	bool tx_stopped;
+ };
+ 
+ struct airoha_gdm_port {
+diff --git a/drivers/net/ethernet/airoha/airoha_pon.c b/drivers/net/ethernet/airoha/airoha_pon.c
+index 6e970a4..a4b9d07 100644
+--- a/drivers/net/ethernet/airoha/airoha_pon.c
++++ b/drivers/net/ethernet/airoha/airoha_pon.c
+@@ -4,6 +4,7 @@
+  * MAC driver tells the frame engine which GEM ports and T-CONTs exist.
+  */
+ #include <linux/bsearch.h>
++#include <linux/delay.h>
+ #include <linux/if_vlan.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+@@ -19,6 +20,14 @@
+ #define AIROHA_PON_MIN_FRAME_LEN	60
+ /* GDM2 RX channels the PON MAC delivers on */
+ #define AIROHA_PON_RX_CHANS		GENMASK(1, 0)
++
++/* reads of a hold bit before and after its release is asked for */
++#define AIROHA_PON_HOLD_READS		12
++#define AIROHA_PON_UNHOLD_READS		11
++/* 1 ms waits for a channel to retire */
++#define AIROHA_PON_RETIRE_TRIES		10
++/* reads of the RX channels once every channel retired */
++#define AIROHA_PON_RX_IDLE_READS	10
+ /* control frames leave on T-CONT channel 0, in its highest queue */
+ #define AIROHA_PON_CTRL_QUEUE		7
+ /* no meter, and neither account group counts the frame */
+@@ -462,6 +471,101 @@ static void airoha_pon_close_queues(struct airoha_pon *pon,
+ 			close ? mask : 0);
+ }
+ 
++static bool airoha_pon_fe_poll_clear(struct airoha_eth *eth, u32 reg,
++				     u32 mask, int reads)
++{
++	while (reads--) {
++		if (!(airoha_fe_rr(eth, reg) & mask))
++			return true;
++	}
++
++	return false;
++}
++
++/* Release one side of GDM2's hold unless it drops by itself. */
++static int airoha_pon_unhold(struct airoha_eth *eth, u32 hold, u32 unhold)
++{
++	u32 reg = REG_GDM_CHN_RLS(AIROHA_GDM2_IDX);
++	bool released;
++
++	if (airoha_pon_fe_poll_clear(eth, reg, hold, AIROHA_PON_HOLD_READS))
++		return 0;
++
++	airoha_fe_set(eth, reg, unhold);
++	released = airoha_pon_fe_poll_clear(eth, reg, hold,
++					    AIROHA_PON_UNHOLD_READS);
++	airoha_fe_clear(eth, reg, unhold);
++
++	return released ? 0 : -ETIMEDOUT;
++}
++
++static int airoha_pon_release_hold(struct airoha_pon *pon)
++{
++	struct airoha_eth *eth = airoha_pon_eth(pon);
++	int err;
++
++	err = airoha_pon_unhold(eth, GDM_CHN_RLS_TX_HOLD_MASK,
++				GDM_CHN_RLS_TX_UNHOLD_MASK);
++	if (err)
++		return err;
++
++	return airoha_pon_unhold(eth, GDM_CHN_RLS_RX_HOLD_MASK,
++				 GDM_CHN_RLS_RX_UNHOLD_MASK);
++}
++
++static bool airoha_pon_chan_retired(struct airoha_pon *pon, unsigned int ch)
++{
++	struct airoha_eth *eth = airoha_pon_eth(pon);
++	u32 val;
++
++	val = airoha_fe_rr(eth, REG_GDM_CHN_RLS(AIROHA_GDM2_IDX));
++	if (!(val & GDM_CHN_RLS_DONE_MASK))
++		return false;
++
++	val = airoha_fe_rr(eth, REG_GDM_CHN_BUSY(AIROHA_GDM2_IDX));
++	if (val & BIT(ch))
++		return false;
++
++	val = airoha_qdma_rr(pon->qdma, REG_TXQ_CHAN_OCC(ch));
++
++	return !(val & TXQ_CHAN_OCC_MASK(ch));
++}
++
++/* Have GDM2 give up the frames channel @ch holds, with only that channel
++ * enabled meanwhile.
++ */
++static int airoha_pon_retire_chan(struct airoha_pon *pon, unsigned int ch)
++{
++	struct airoha_eth *eth = airoha_pon_eth(pon);
++	u32 tx, rx;
++	int i;
++
++	tx = airoha_fe_rr(eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX));
++	rx = airoha_fe_rr(eth, REG_GDM_RXCHN_EN(AIROHA_GDM2_IDX));
++	airoha_fe_wr(eth, REG_GDM_RXCHN_EN(AIROHA_GDM2_IDX), BIT(ch));
++	airoha_fe_wr(eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX), BIT(ch));
++
++	airoha_fe_wr(eth, REG_GDM_CHN_RLS(AIROHA_GDM2_IDX),
++		     FIELD_PREP(GDM_CHN_RLS_CHAN_MASK, ch) |
++		     GDM_CHN_RLS_START_MASK);
++	usleep_range(USEC_PER_MSEC, 2 * USEC_PER_MSEC);
++
++	/* done once the channel reads idle twice in a row */
++	for (i = 0; i < AIROHA_PON_RETIRE_TRIES; i++) {
++		if (airoha_pon_chan_retired(pon, ch) &&
++		    airoha_pon_chan_retired(pon, ch))
++			break;
++
++		usleep_range(USEC_PER_MSEC, 2 * USEC_PER_MSEC);
++	}
++
++	airoha_fe_wr(eth, REG_GDM_CHN_RLS(AIROHA_GDM2_IDX), 0);
++	airoha_fe_wr(eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX), tx);
++	airoha_fe_wr(eth, REG_GDM_RXCHN_EN(AIROHA_GDM2_IDX), rx);
++
++	return i < AIROHA_PON_RETIRE_TRIES ? 0 : -ETIMEDOUT;
++}
++
+ /**
+  * airoha_pon_tcont_open() - start carrying a T-CONT
+  * @pon: the interface
+@@ -513,14 +617,17 @@ EXPORT_SYMBOL_GPL(airoha_pon_tcont_open);
+  * @tcont: the T-CONT
+  *
+  * Call it when the OLT withdraws the T-CONT's Alloc-ID. The T-CONT's
+- * queues close; frames already in them stay there until it opens again.
++ * queues close, and GDM2 gives up the frames its channel still holds.
+  * PPE flows towards the PON are unbound, so the ones on other T-CONTs bind
+  * again with their next frame.
+  *
+- * Return: 0 or -EINVAL.
++ * Return: 0, -EINVAL, or -ETIMEDOUT when the channel did not give up its
++ * frames in time; the T-CONT is closed either way.
+  */
+ int airoha_pon_tcont_close(struct airoha_pon *pon, unsigned int tcont)
+ {
++	int err, ret;
++
+ 	if (tcont >= AIROHA_PON_NUM_TCONTS)
+ 		return -EINVAL;
+ 
+@@ -533,14 +640,86 @@ int airoha_pon_tcont_close(struct airoha_pon *pon, unsigned int tcont)
+ 	    test_bit(tcont, pon->block_saved))
+ 		airoha_qdma_set(pon->qdma, REG_CHAN_BLOCK_CFG, BIT(tcont));
+ 
++	ret = airoha_pon_release_hold(pon);
++	err = airoha_pon_retire_chan(pon, tcont);
++
+ 	mutex_unlock(&pon->lock);
+ 
+ 	airoha_ppe_flush_pon_flows(airoha_pon_eth(pon));
+ 
+-	return 0;
++	return ret ?: err;
+ }
+ EXPORT_SYMBOL_GPL(airoha_pon_tcont_close);
+ 
++/**
++ * airoha_pon_retire_all() - have GDM2 give up what every channel holds
++ * @pon: the interface
++ *
++ * Call it when the PON MAC starts over: a GPON ONU whose serial number the
++ * OLT refused or which the OLT reset, an XGS-PON ONU at every change of
++ * its reset control. Every frame sent on the port is refused while it
++ * runs. The T-CONTs stay open or closed as they were.
++ *
++ * Return: 0, or -ETIMEDOUT when a channel did not give up its frames in
++ * time; the other channels are retired either way.
++ */
++int airoha_pon_retire_all(struct airoha_pon *pon)
++{
++	struct airoha_eth *eth = airoha_pon_eth(pon);
++	u32 closed[AIROHA_PON_NUM_TCONTS / 4];
++	unsigned int ch;
++	int i, err, ret;
++	u32 tx, rx;
++
++	mutex_lock(&pon->lock);
++
++	WRITE_ONCE(pon->tx_stopped, true);
++	/* every sender tests the flag under RCU */
++	synchronize_rcu();
++
++	tx = airoha_fe_rr(eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX));
++	rx = airoha_fe_rr(eth, REG_GDM_RXCHN_EN(AIROHA_GDM2_IDX));
++	/* open every queue, so that its frames can leave */
++	for (i = 0; i < ARRAY_SIZE(closed); i++) {
++		closed[i] = airoha_qdma_rr(pon->qdma,
++					   REG_QUEUE_CLOSE_CFG(i << 2));
++		airoha_qdma_wr(pon->qdma, REG_QUEUE_CLOSE_CFG(i << 2), 0);
++	}
++
++	ret = airoha_pon_release_hold(pon);
++	airoha_fe_wr(eth, REG_GDM_RXCHN_EN(AIROHA_GDM2_IDX), 0);
++	airoha_fe_wr(eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX), 0);
++	usleep_range(USEC_PER_MSEC, 2 * USEC_PER_MSEC);
++
++	for (ch = 0; ch < AIROHA_PON_NUM_TCONTS; ch++) {
++		err = airoha_pon_retire_chan(pon, ch);
++		if (err) {
++			dev_warn(eth->dev, "PON channel %u did not retire\n",
++				 ch);
++			ret = ret ?: err;
++		}
++	}
++
++	if (!airoha_pon_fe_poll_clear(eth, REG_GDM_RXCHN_BUSY(AIROHA_GDM2_IDX),
++				      U32_MAX, AIROHA_PON_RX_IDLE_READS)) {
++		dev_warn(eth->dev, "PON RX channels did not retire\n");
++		ret = ret ?: -ETIMEDOUT;
++	}
++
++	airoha_fe_wr(eth, REG_GDM_TXCHN_EN(AIROHA_GDM2_IDX), tx);
++	airoha_fe_wr(eth, REG_GDM_RXCHN_EN(AIROHA_GDM2_IDX), rx);
++	for (i = 0; i < ARRAY_SIZE(closed); i++)
++		airoha_qdma_wr(pon->qdma, REG_QUEUE_CLOSE_CFG(i << 2),
++			       closed[i]);
++
++	WRITE_ONCE(pon->tx_stopped, false);
++
++	mutex_unlock(&pon->lock);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(airoha_pon_retire_all);
++
+ /**
+  * airoha_pon_tcont_sched() - set how a T-CONT's queues share it
+  * @pon: the interface
+@@ -733,6 +912,9 @@ int airoha_pon_tx_msg(struct airoha_pon *pon, struct sk_buff *skb, u32 *msg0,
+ 	if (!netif_carrier_ok(netdev_from_priv(pon->dev)))
+ 		return -ENOLINK;
+ 
++	if (READ_ONCE(pon->tx_stopped))
++		return -EAGAIN;
++
+ 	err = airoha_pon_resolve_skb(pon, skb, &gem);
+ 	if (err)
+ 		return err;
+@@ -831,7 +1013,8 @@ void airoha_pon_ctrl_tx_wake(struct airoha_pon *pon)
+  * any error it is still the caller's.
+  *
+  * Return: 0; -EBUSY when the control ring is full, and ctrl_tx_wake()
+- * follows; -ENETDOWN while the port is down; -EINVAL.
++ * follows; -ENETDOWN while the port is down; -EAGAIN while
++ * airoha_pon_retire_all() runs; -EINVAL.
+  */
+ int airoha_pon_xmit_ctrl(struct airoha_pon *pon, struct sk_buff *skb,
+ 			 u16 port_id, u32 flags)
+@@ -858,7 +1041,12 @@ int airoha_pon_xmit_ctrl(struct airoha_pon *pon, struct sk_buff *skb,
+ 	skb->dev = netdev;
+ 	skb_set_queue_mapping(skb, AIROHA_PON_CTRL_RING);
+ 
++	/* a BH-disabled section is an RCU reader for airoha_pon_retire_all() */
+ 	local_bh_disable();
++	if (READ_ONCE(pon->tx_stopped)) {
++		local_bh_enable();
++		return -EAGAIN;
++	}
+ 	ret = airoha_qdma_tx_skb(pon->qdma, skb, netdev, AIROHA_PON_CTRL_RING,
+ 				 msg0, msg1, false);
+ 	local_bh_enable();
+diff --git a/drivers/net/ethernet/airoha/airoha_regs.h b/drivers/net/ethernet/airoha/airoha_regs.h
+index 42a46d9..433d15f 100644
+--- a/drivers/net/ethernet/airoha/airoha_regs.h
++++ b/drivers/net/ethernet/airoha/airoha_regs.h
+@@ -167,12 +167,23 @@
+ #define LPBK_EN_MASK			BIT(0)
+ 
+ #define REG_GDM_CHN_RLS(_n)		(GDM_BASE(_n) + 0x20)
++#define GDM_CHN_RLS_RX_HOLD_MASK	BIT(27)
+ #define MBI_RX_AGE_SEL_MASK		GENMASK(26, 25)
++#define GDM_CHN_RLS_RX_UNHOLD_MASK	BIT(24)
++#define GDM_CHN_RLS_TX_HOLD_MASK	BIT(19)
+ #define MBI_TX_AGE_SEL_MASK		GENMASK(18, 17)
++#define GDM_CHN_RLS_TX_UNHOLD_MASK	BIT(16)
++#define GDM_CHN_RLS_CHAN_MASK		GENMASK(8, 4)
++#define GDM_CHN_RLS_DONE_MASK		BIT(1)
++#define GDM_CHN_RLS_START_MASK		BIT(0)
+ 
+ #define REG_GDM_TXCHN_EN(_n)		(GDM_BASE(_n) + 0x24)
+ #define REG_GDM_RXCHN_EN(_n)		(GDM_BASE(_n) + 0x28)
+ 
++/* bit n set: channel n still holds a frame */
++#define REG_GDM_CHN_BUSY(_n)		(GDM_BASE(_n) + 0x70)
++#define REG_GDM_RXCHN_BUSY(_n)		(GDM_BASE(_n) + 0x74)
++
+ #define REG_FE_CPORT_CFG		(GDM1_BASE + 0x40)
+ #define FE_CPORT_PAD			BIT(26)
+ #define FE_CPORT_PORT_XFC_MASK		BIT(25)
+@@ -873,6 +884,10 @@
+ #define SLA_SLOW_TICK_RATIO_MASK	GENMASK(29, 16)
+ #define SLA_FAST_TICK_MASK		GENMASK(15, 0)
+ 
++/* one byte per channel: the frames its queues hold */
++#define REG_TXQ_CHAN_OCC(_n)		(0x1280 + ((_n) & 0xfc))
++#define TXQ_CHAN_OCC_MASK(_n)		GENMASK(7 + (((_n) & 0x3) << 3), ((_n) & 0x3) << 3)
++
+ /* CTRL */
+ #define QDMA_DESC_DONE_MASK		BIT(31)
+ #define QDMA_DESC_DROP_MASK		BIT(30) /* tx: drop - rx: overflow */
+diff --git a/include/linux/soc/airoha/airoha_pon.h b/include/linux/soc/airoha/airoha_pon.h
+index 62fda72..0e7dfa1 100644
+--- a/include/linux/soc/airoha/airoha_pon.h
++++ b/include/linux/soc/airoha/airoha_pon.h
+@@ -112,6 +112,7 @@ int airoha_pon_set_rules(struct airoha_pon *pon,
+ int airoha_pon_tcont_open(struct airoha_pon *pon, unsigned int tcont,
+ 			  u32 flags);
+ int airoha_pon_tcont_close(struct airoha_pon *pon, unsigned int tcont);
++int airoha_pon_retire_all(struct airoha_pon *pon);
+ int airoha_pon_tcont_sched(struct airoha_pon *pon, unsigned int tcont,
+ 			   unsigned int nstrict, const u16 *weights);
+ int airoha_pon_tcont_rate(struct airoha_pon *pon, unsigned int tcont,
