@@ -1,0 +1,175 @@
+From: John Morkel <john@morkel.me>
+Date: Wed, 4 Nov 2026 12:00:00 -0700
+Subject: [PATCH] net: airoha: report a PON line's FEC counts through
+ ethtool
+
+A PON line's downstream frames carry Reed-Solomon FEC whenever the OLT
+turns it on, and the PON PHY counts the codewords its decoder corrected
+and the ones it could not. Those counts belong to the PON MAC driver,
+which reads the PHY, while the netdev a user asks is the PON interface,
+GDM2 in PON mode. So far they could be read only through the PON MAC
+driver's own netlink family.
+
+Add an optional fec_stats() call to the PON MAC driver's ops and report
+its counts through the standard FEC statistics: codewords corrected as
+corrected_blocks, codewords not correctable as uncorrectable_blocks.
+corrected_bits stays unreported: the PHY counts the bytes it corrected,
+and a byte can hold up to eight of the bits. get_fecparam() says the
+link chooses (ETHTOOL_FEC_AUTO), since the OLT decides, and reports RS
+active while the downstream frames carry FEC, off otherwise. Both
+return -EOPNOTSUPP on a port that is not a PON interface, and on one
+whose PON MAC driver reports no FEC.
+
+The call is made under the PON lock rather than under RCU, since the
+PON MAC driver may sleep to read the PHY.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.c b/drivers/net/ethernet/airoha/airoha_eth.c
+index 90af630..bd05350 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.c
++++ b/drivers/net/ethernet/airoha/airoha_eth.c
+@@ -2958,6 +2958,42 @@ airoha_ethtool_set_link_ksettings(struct net_device *netdev,
+ 	return phylink_ethtool_ksettings_set(dev->phylink, cmd);
+ }
+ 
++static int airoha_ethtool_get_fecparam(struct net_device *netdev,
++				       struct ethtool_fecparam *fec)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	struct airoha_pon_fec_stats st = {};
++	int err;
++
++	/* Only a PON line has FEC, and its OLT decides whether it is on. */
++	if (!dev->pon)
++		return -EOPNOTSUPP;
++
++	err = airoha_pon_fec_stats(dev->pon, &st);
++	if (err)
++		return err;
++
++	fec->fec = ETHTOOL_FEC_AUTO;
++	fec->active_fec = st.active ? ETHTOOL_FEC_RS : ETHTOOL_FEC_OFF;
++
++	return 0;
++}
++
++static void airoha_ethtool_get_fec_stats(struct net_device *netdev,
++					 struct ethtool_fec_stats *stats,
++					 struct ethtool_fec_hist *hist)
++{
++	struct airoha_gdm_dev *dev = netdev_priv(netdev);
++	struct airoha_pon_fec_stats st = {};
++
++	if (!dev->pon || airoha_pon_fec_stats(dev->pon, &st))
++		return;
++
++	/* The PON PHY counts the bytes it corrected, not the bits. */
++	stats->corrected_blocks.total = st.corrected_words;
++	stats->uncorrectable_blocks.total = st.uncorrectable_words;
++}
++
+ int airoha_qdma_set_chan_tx_sched(struct airoha_qdma *qdma, int channel,
+ 				  enum tx_sched_mode mode, const u16 *weights,
+ 				  u8 n_weights)
+@@ -3851,6 +3887,8 @@ static const struct ethtool_ops airoha_ethtool_ops = {
+ 	.get_link_ksettings	= airoha_ethtool_get_link_ksettings,
+ 	.set_link_ksettings	= airoha_ethtool_set_link_ksettings,
+ 	.get_link		= ethtool_op_get_link,
++	.get_fecparam		= airoha_ethtool_get_fecparam,
++	.get_fec_stats		= airoha_ethtool_get_fec_stats,
+ };
+ 
+ static int airoha_metadata_dst_alloc(struct airoha_gdm_port *port)
+diff --git a/drivers/net/ethernet/airoha/airoha_eth.h b/drivers/net/ethernet/airoha/airoha_eth.h
+index 3eadf22..a1392ea 100644
+--- a/drivers/net/ethernet/airoha/airoha_eth.h
++++ b/drivers/net/ethernet/airoha/airoha_eth.h
+@@ -848,6 +848,8 @@ int airoha_pon_rx(struct airoha_pon *pon, struct sk_buff *skb, u32 msg0,
+ 		  u32 msg1);
+ int airoha_pon_resolve(struct airoha_pon *pon, int ifindex, u16 vid, u8 pcp,
+ 		       struct airoha_pon_gem *gem);
++int airoha_pon_fec_stats(struct airoha_pon *pon,
++			 struct airoha_pon_fec_stats *st);
+ int airoha_pon_ani_lower(struct net_device **netdev);
+ struct airoha_pon *airoha_dev_pon(const struct net_device *netdev);
+ int airoha_pon_ani_register(void);
+diff --git a/drivers/net/ethernet/airoha/airoha_pon.c b/drivers/net/ethernet/airoha/airoha_pon.c
+index 93442ef..a58a935 100644
+--- a/drivers/net/ethernet/airoha/airoha_pon.c
++++ b/drivers/net/ethernet/airoha/airoha_pon.c
+@@ -1015,6 +1015,31 @@ int airoha_pon_tcont_counters(struct airoha_pon *pon, unsigned int tcont,
+ }
+ EXPORT_SYMBOL_GPL(airoha_pon_tcont_counters);
+ 
++/**
++ * airoha_pon_fec_stats() - the PON line's downstream FEC counts
++ * @pon: the interface
++ * @st: filled in from the PON MAC driver
++ *
++ * Return: 0; -EOPNOTSUPP while no PON MAC driver that reports them is
++ * registered; or that driver's error.
++ */
++int airoha_pon_fec_stats(struct airoha_pon *pon,
++			 struct airoha_pon_fec_stats *st)
++{
++	struct airoha_pon_client *client;
++	int err = -EOPNOTSUPP;
++
++	/* the lock, not RCU: the callback may sleep */
++	mutex_lock(&pon->lock);
++	client = rcu_dereference_protected(pon->client,
++					   lockdep_is_held(&pon->lock));
++	if (client && client->ops->fec_stats)
++		err = client->ops->fec_stats(client->priv, st);
++	mutex_unlock(&pon->lock);
++
++	return err;
++}
++
+ static const struct airoha_pon_gem *
+ airoha_pon_find_gem(const struct airoha_pon_map *map, u16 port_id)
+ {
+diff --git a/include/linux/soc/airoha/airoha_pon.h b/include/linux/soc/airoha/airoha_pon.h
+index 85e2720..8a12de7 100644
+--- a/include/linux/soc/airoha/airoha_pon.h
++++ b/include/linux/soc/airoha/airoha_pon.h
+@@ -85,6 +85,21 @@ struct airoha_pon_rule {
+ /* airoha_pon_tcont_open(): the channel never blocks (the OMCI T-CONT) */
+ #define AIROHA_PON_TCONT_NONBLOCK	BIT(0)
+ 
++/**
++ * struct airoha_pon_fec_stats - the PON line's downstream FEC counts
++ * @corrected_words: codewords the FEC decoder corrected
++ * @uncorrectable_words: codewords it could not correct
++ * @active: the downstream frames carry FEC now
++ *
++ * The counts are cumulative: they never go back while the PON MAC driver
++ * stays registered.
++ */
++struct airoha_pon_fec_stats {
++	u64 corrected_words;
++	u64 uncorrectable_words;
++	bool active;
++};
++
+ /**
+  * struct airoha_pon_ops - calls from the frame engine driver into the PON
+  *	MAC driver
+@@ -93,11 +108,16 @@ struct airoha_pon_rule {
+  *	left the frame's integrity check to software. Called from NAPI.
+  * @ctrl_tx_wake: airoha_pon_xmit_ctrl() returned -EBUSY earlier and the
+  *	control ring has room again. Called from NAPI.
++ * @fec_stats: fill @st with the line's downstream FEC counts. Optional:
++ *	without it the PON interface reports no FEC. Called in process
++ *	context under the frame engine driver's PON lock, so it may sleep
++ *	but must not call an airoha_pon_*() function.
+  */
+ struct airoha_pon_ops {
+ 	void (*rx_ctrl)(void *priv, struct sk_buff *skb, u16 port_id,
+ 			u32 flags);
+ 	void (*ctrl_tx_wake)(void *priv);
++	int (*fec_stats)(void *priv, struct airoha_pon_fec_stats *st);
+ };
+ 
+ #define AIROHA_PON_RX_MIC_UNCHECKED	BIT(0)
