@@ -1,0 +1,40 @@
+From: John Morkel <john@morkel.me>
+Date: Thu, 29 Oct 2026 12:00:00 -0700
+Subject: [PATCH] net: airoha: pad a short PON data frame to the Ethernet
+ minimum
+
+GDM2 in PON mode sends a frame shorter than 60 octets as it is: its TX
+runt counter counts the frame, and nothing at the far end of the fibre
+answers it. The stack hands the driver such frames: an ARP request on a
+VLAN is 46 octets, so a router-mode WAN on the PON gets a DHCP lease
+but never resolves its gateway. Every longer frame (DHCP, neighbour
+discovery, an echo request) gets through, and so do the frames a LAN
+port bridges, which arrive padded.
+
+The vendor's PON driver pads every data frame shorter than ETH_ZLEN in
+its transmit path, and the frame engine's pad enable is off on GDM2
+there too. Do the same in airoha_pon_tx_msg(), which every data frame
+towards the PON passes, the ones an ANI port device sends included.
+Control frames are not Ethernet and keep their length.
+
+Signed-off-by: John Morkel <john@morkel.me>
+---
+diff --git a/drivers/net/ethernet/airoha/airoha_pon.c b/drivers/net/ethernet/airoha/airoha_pon.c
+index 81a88b4..93442ef 100644
+--- a/drivers/net/ethernet/airoha/airoha_pon.c
++++ b/drivers/net/ethernet/airoha/airoha_pon.c
+@@ -1128,6 +1128,14 @@ int airoha_pon_tx_msg(struct airoha_pon *pon, struct net_device *netdev,
+ 	if (err)
+ 		return err;
+ 
++	/* GDM2 sends a frame shorter than the Ethernet minimum, tags
++	 * included, as it is (a TX runt), and it never reaches the far end
++	 * of the fibre: an ARP request would go unanswered. The caller
++	 * frees the frame on an error.
++	 */
++	if (__skb_put_padto(skb, ETH_ZLEN, false))
++		return -ENOMEM;
++
+ 	*msg0 &= ~(QDMA_ETH_TXMSG_CHAN_MASK | QDMA_ETH_TXMSG_QUEUE_MASK |
+ 		   QDMA_ETH_TXMSG_SP_TAG_MASK);
+ 	*msg0 |= FIELD_PREP(QDMA_ETH_TXMSG_CHAN_MASK, gem.tcont) |
